@@ -9,6 +9,8 @@ using Library;
 using Library.Grid;
 using UI;
 using UI.Shop;
+using UI.CouncilRoomScreen;
+using GameState;
 using GameState.Data;
 using UnityEngine;
 
@@ -37,6 +39,17 @@ namespace CombolandsTweaks
         private Dictionary<Building, Row> _rows = new Dictionary<Building, Row>();
         private double _bestGain;
         private GameTag _shownTag = GameTag.None;
+        // Council votes: the member hovered, and whether it's their current votes (council room) or one more.
+        private CouncilCharacter _shownVote = CouncilCharacter.None;
+        private bool _shownVoteCurrent;
+        private int _shownKey;
+        private CouncilCharacter _jobVote = CouncilCharacter.None;
+        private bool _jobVoteCurrent;
+        private GamePieceChoice[] _choices = Array.Empty<GamePieceChoice>();
+        private CouncilCharacterHover[] _councilHovers = Array.Empty<CouncilCharacterHover>();
+
+        private static readonly AccessTools.FieldRef<CouncilFavour, Dictionary<CouncilCharacter, int>> CouncilVotes =
+            AccessTools.FieldRefAccess<CouncilFavour, Dictionary<CouncilCharacter, int>>("_councilVotes");
         private int _shownBoard;
         private bool _loggedError;
 
@@ -82,33 +95,179 @@ namespace CombolandsTweaks
 
         private void Update()
         {
-            GameTag tag = Plugin.UpgradePreviewEnabled.Value ? FindUpgrade() : GameTag.None;
-            if (tag == GameTag.None || !MonoSingleton<BuildingController>.HasInstance)
+            GameTag tag = GameTag.None;
+            CouncilCharacter vote = CouncilCharacter.None;
+            bool current = false;
+            if (Plugin.UpgradePreviewEnabled.Value && MonoSingleton<BuildingController>.HasInstance)
+            {
+                tag = FindUpgrade();
+                if (tag == GameTag.None && SerializedMonoSingleton<CouncilFavour>.HasInstance)
+                    vote = FindVote(out current);
+            }
+            int key = tag != GameTag.None ? (int)tag : vote != CouncilCharacter.None ? -(1000 + (int)vote * 2 + (current ? 1 : 0)) : 0;
+            if (key == 0)
             {
                 _rows.Clear();
                 _jobActive = false;
+                _shownKey = 0;
                 _shownTag = GameTag.None;
+                _shownVote = CouncilCharacter.None;
                 Showing = false;
                 return;
             }
 
             int board = PlacementScores.BoardSignature();
-            if (tag != _shownTag)
+            if (key != _shownKey)
             {
                 // Never show one upgrade's numbers for another while the new ones are worked out.
                 _rows.Clear();
                 _bestGain = 0;
             }
-            if (tag != _shownTag || board != _shownBoard)
+            if (key != _shownKey || board != _shownBoard)
             {
                 StartJob(tag);
+                _jobVote = vote;
+                _jobVoteCurrent = current;
+                _shownKey = key;
                 _shownTag = tag;
+                _shownVote = vote;
+                _shownVoteCurrent = current;
                 _shownBoard = board;
             }
             if (_jobActive)
-                StepJob();
+            {
+                if (_jobVote != CouncilCharacter.None)
+                    StepVote();
+                else
+                    StepJob();
+            }
             Showing = _rows.Count > 0;
         }
+
+        // A council vote under the mouse: one you could get (consumables bar, shop, pack pick) or a member in the
+        // council room, whose current votes are shown instead.
+        private CouncilCharacter FindVote(out bool current)
+        {
+            current = false;
+            foreach (Consumable c in _consumables)
+                if (c != null && c.isActiveAndEnabled && c.ConsumableType == GameItemType.CouncilVote
+                    && c.GameTag.CharacterFromFavour() != CouncilCharacter.None && IsMouseOver(c.transform as RectTransform))
+                    return c.GameTag.CharacterFromFavour();
+            foreach (ShopSingle sh in _shopItems)
+            {
+                if (sh == null || !sh.isActiveAndEnabled || sh.ItemType != GameItemType.CouncilVote)
+                    continue;
+                CouncilCharacter c = Traverse.Create(sh).Field<GameTag>("_tag").Value.CharacterFromFavour();
+                if (c != CouncilCharacter.None && IsMouseOver(sh.transform as RectTransform))
+                    return c;
+            }
+            foreach (GamePieceChoice choice in _choices)
+            {
+                if (choice == null || !choice.isActiveAndEnabled)
+                    continue;
+                CouncilCharacter c = Traverse.Create(choice).Field<GameTag>("_type").Value.CharacterFromFavour();
+                if (c != CouncilCharacter.None && IsMouseOver(choice.transform as RectTransform))
+                    return c;
+            }
+            foreach (CouncilCharacterHover h in _councilHovers)
+            {
+                if (h == null || !h.isActiveAndEnabled || h.CouncilCharacter == CouncilCharacter.None || h.Votes <= 0)
+                    continue;
+                if (IsMouseOver(h.transform as RectTransform))
+                {
+                    current = true;
+                    return h.CouncilCharacter;
+                }
+            }
+            return CouncilCharacter.None;
+        }
+
+        // Points per turn of a batch of buildings with the member's votes set to `votes`, then restored.
+        private void ValuesWithVotes(List<Building> batch, CouncilCharacter c, int votes, double[] into)
+        {
+            CouncilFavour council = SerializedMonoSingleton<CouncilFavour>.Instance;
+            Dictionary<CouncilCharacter, int> dict = CouncilVotes(council);
+            bool hadDict = dict != null;
+            int old = council.GetVotesFor(c);
+            bool hadKey = hadDict && dict.ContainsKey(c);
+            bool change = votes != old;
+            if (change)
+            {
+                if (!hadDict)
+                    CouncilVotes(council) = dict = new Dictionary<CouncilCharacter, int>();
+                dict[c] = votes;
+                BuildingExtensions.ResetCaches();
+            }
+            try
+            {
+                for (int i = 0; i < batch.Count; i++)
+                    into[i] = Attributed(batch[i], out double v, out _) ? v : double.NaN;
+            }
+            finally
+            {
+                if (change)
+                {
+                    if (!hadDict)
+                        CouncilVotes(council) = null;
+                    else if (hadKey)
+                        dict[c] = old;
+                    else
+                        dict.Remove(c);
+                    BuildingExtensions.ResetCaches();
+                }
+            }
+        }
+
+        // A vote changes every building in the member's categories at once, so buildings are done in small batches,
+        // each with the votes changed and restored within the frame.
+        private void StepVote()
+        {
+            const int BatchSize = 8;
+            var frame = System.Diagnostics.Stopwatch.StartNew();
+            int cur = SerializedMonoSingleton<CouncilFavour>.Instance.GetVotesFor(_jobVote);
+            int from = _jobVoteCurrent ? 0 : cur;
+            int to = _jobVoteCurrent ? cur : cur + 1;
+            var batch = new List<Building>(BatchSize);
+            var now = new double[BatchSize];
+            var after = new double[BatchSize];
+            while (_jobIndex < _jobBuildings.Count && frame.Elapsed.TotalMilliseconds < FrameBudgetMs)
+            {
+                batch.Clear();
+                while (batch.Count < BatchSize && _jobIndex < _jobBuildings.Count)
+                {
+                    Building b = _jobBuildings[_jobIndex++];
+                    if (b != null)
+                        batch.Add(b);
+                }
+                try
+                {
+                    ValuesWithVotes(batch, _jobVote, from, now);
+                    ValuesWithVotes(batch, _jobVote, to, after);
+                }
+                catch (Exception e)
+                {
+                    LogOnce($"Vote preview for {_jobVote} failed: {e}");
+                    continue;
+                }
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    if (double.IsNaN(now[i]) || double.IsNaN(after[i]) || Math.Abs(after[i] - now[i]) < 0.05)
+                        continue;
+                    var row = new Row { Now = now[i], After = after[i], PerTurn = true };
+                    _jobRows[batch[i]] = row;
+                    if (row.After - row.Now > _jobBest)
+                        _jobBest = row.After - row.Now;
+                }
+            }
+            if (_jobIndex < _jobBuildings.Count)
+                return;
+            _jobActive = false;
+            (_rows, _jobRows) = (_jobRows, _rows);
+            _bestGain = _jobBest;
+        }
+
+        private static string NameOf(CouncilCharacter c) =>
+            Framework.ScriptableObjectSingleton<StringLookup>.Instance.GetNameForCouncilCharacter(c, out string name) ? name : c.ToString();
 
         // The upgrade waiting for a target wins; otherwise one under the mouse in the shop or the consumables bar.
         private GameTag FindUpgrade()
@@ -133,6 +292,8 @@ namespace CombolandsTweaks
                 _nextFind = Time.unscaledTime + FindInterval;
                 _consumables = FindObjectsByType<Consumable>(FindObjectsSortMode.None);
                 _shopItems = FindObjectsByType<ShopSingle>(FindObjectsSortMode.None);
+                _choices = FindObjectsByType<GamePieceChoice>(FindObjectsSortMode.None);
+                _councilHovers = FindObjectsByType<CouncilCharacterHover>(FindObjectsSortMode.None);
             }
             foreach (Consumable c in _consumables)
                 if (c != null && c.isActiveAndEnabled && IsSupported(c.GameTag) && IsMouseOver(c.transform as RectTransform))
@@ -603,7 +764,23 @@ namespace CombolandsTweaks
             if (top.Count == 0)
                 return;
             top.Sort((a, b) => (b.Value.After - b.Value.Now).CompareTo(a.Value.After - a.Value.Now));
-            var sb = new System.Text.StringBuilder("Best buildings for this upgrade (points per turn)\n");
+            double total = 0;
+            foreach (KeyValuePair<Building, Row> e in _rows)
+                if (e.Key != null && e.Value.PerTurn)
+                    total += e.Value.After - e.Value.Now;
+            string title;
+            if (_shownVote != CouncilCharacter.None)
+            {
+                int cur = SerializedMonoSingleton<CouncilFavour>.Instance.GetVotesFor(_shownVote);
+                title = _shownVoteCurrent
+                    ? $"{NameOf(_shownVote)}'s {cur} vote{(cur == 1 ? "" : "s")} add {Format(total)} points per turn"
+                    : $"A vote for {NameOf(_shownVote)} ({cur} \u2192 {cur + 1}): {(total >= 0 ? "+" : "")}{Format(total)} points per turn";
+            }
+            else
+            {
+                title = $"Best buildings for this upgrade (points per turn)";
+            }
+            var sb = new System.Text.StringBuilder(title + "\n");
             for (int i = 0; i < top.Count && i < 5; i++)
             {
                 Row r = top[i].Value;
@@ -626,7 +803,9 @@ namespace CombolandsTweaks
         {
             double gain = r.After - r.Now;
             string how;
-            if (IsPaint(_shownTag))
+            if (_shownVote != CouncilCharacter.None)
+                how = _shownVoteCurrent ? $"points per turn without {NameOf(_shownVote)}'s votes \u2192 now" : $"points per turn now \u2192 with one more vote for {NameOf(_shownVote)}";
+            else if (IsPaint(_shownTag))
                 how = $"points per turn of it and the {r.Affected} building{(r.Affected == 1 ? "" : "s")} around it that it counts for";
             else if (!r.PerTurn)
                 how = $"points per activation (triggered by {(_eventTriggeredBy.TryGetValue(b, out string by) ? by : "a neighbour")} when it reacts)";
