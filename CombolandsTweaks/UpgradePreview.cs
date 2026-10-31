@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using Entities;
+using Environment;
 using HarmonyLib;
 using Interaction;
 using Interaction.InteractionStates;
@@ -115,6 +116,7 @@ namespace CombolandsTweaks
                 return;
             float amount = ConsumableBehaviour.GetBuildingSupplyParam(tag);
             BuildingExtensions.ResetCaches();
+            BuildTriggerModel();
             foreach (Building b in MonoSingleton<BuildingController>.Instance.Buildings)
             {
                 if (b == null || b.Values == null || !b.isActiveAndEnabled)
@@ -126,17 +128,15 @@ namespace CombolandsTweaks
                     if (tag == GameTag.BsStatModMult && !b.Tag.CanGetMult())
                         continue;
                     Row row = default;
-                    row.PerTurn = b.GamePieceWithCount != null && b.Cooldown > 0;
-                    // Buildings without a countdown only score when something else triggers them, so a per-turn
-                    // figure doesn't exist for them.
-                    if (!row.PerTurn)
+                    // Buildings that never activate on their own and that nothing nearby triggers have no
+                    // meaningful figure, so they're left out.
+                    if (!Attributed(b, out row.Now, out row.PerTurn))
                         continue;
-                    row.Now = PointsPerTurn(b, row.PerTurn);
                     Apply(b, tag, amount);
                     try
                     {
                         PlacementScores.ForgetCaches(b);
-                        row.After = PointsPerTurn(b, row.PerTurn);
+                        Attributed(b, out row.After, out _);
                     }
                     finally
                     {
@@ -181,11 +181,141 @@ namespace CombolandsTweaks
             }
         }
 
-        // Points per activation (the game's preview) times activations, spread over the cooldown when it has one.
-        private static double PointsPerTurn(Building b, bool perTurn)
+        // How buildings trigger each other, modelled on the behaviours that call TriggerController.AddOnActivatedTrigger:
+        // most pick (activation count) random buildings from their adjacent tiles or range each time they activate;
+        // a few trigger every match. Ballista, Outpost, Post Office, Sparring Yard and Herb Garden aren't modelled.
+        private enum Area { Adjacent, Range }
+
+        private struct Triggerer
         {
-            double points = PlacementScores.PreviewTotal(b, 1.0) * Math.Max(1, b.Behaviour.GetActivationCount(b));
-            return perTurn ? points / Math.Max(1, b.Cooldown) : points;
+            public Area Area;
+            public bool All;          // triggers every candidate instead of picking at random
+            public bool UseCategories; // only buildings in its target categories
+        }
+
+        private static readonly Dictionary<GameTag, Triggerer> Triggerers = new Dictionary<GameTag, Triggerer>
+        {
+            { GameTag.Sawmill, new Triggerer { Area = Area.Range, UseCategories = true } },
+            { GameTag.Conduit, new Triggerer { Area = Area.Range } },
+            { GameTag.Trawler, new Triggerer { Area = Area.Range, UseCategories = true } },
+            { GameTag.BanditCamp, new Triggerer { Area = Area.Adjacent } },
+            { GameTag.FaerieRing, new Triggerer { Area = Area.Adjacent } },
+            { GameTag.WayStation, new Triggerer { Area = Area.Adjacent } },
+            { GameTag.Brewery, new Triggerer { Area = Area.Adjacent } },
+            { GameTag.Treasury, new Triggerer { Area = Area.Adjacent } },
+            { GameTag.Harvester, new Triggerer { Area = Area.Adjacent } },
+            { GameTag.GuardTower, new Triggerer { Area = Area.Adjacent } },
+            { GameTag.EffigyPyre, new Triggerer { Area = Area.Adjacent, All = true } },
+            { GameTag.Marketplace, new Triggerer { Area = Area.Adjacent, All = true, UseCategories = true } },
+            { GameTag.FishTrap, new Triggerer { Area = Area.Range, All = true, UseCategories = true } },
+        };
+
+        // Per building, before any upgrade: points per activation, and activations per turn it gets from others.
+        private readonly Dictionary<Building, double> _points = new Dictionary<Building, double>();
+        private readonly Dictionary<Building, double> _incoming = new Dictionary<Building, double>();
+        // Triggered only by buildings that react to events (no countdown): how often is unknown.
+        private readonly Dictionary<Building, string> _eventTriggeredBy = new Dictionary<Building, string>();
+
+        private void BuildTriggerModel()
+        {
+            _points.Clear();
+            _incoming.Clear();
+            _eventTriggeredBy.Clear();
+            List<Building> all = MonoSingleton<BuildingController>.Instance.Buildings;
+            foreach (Building b in all)
+                if (b != null && b.Values != null && b.isActiveAndEnabled)
+                    _points[b] = PointsPerActivation(b);
+
+            foreach (Building t in all)
+            {
+                if (t == null || !_points.ContainsKey(t) || !Triggerers.ContainsKey(t.Tag))
+                    continue;
+                List<Building> targets = Candidates(t);
+                double share = Share(t, targets);
+                double rate = OwnRate(t);
+                foreach (Building x in targets)
+                {
+                    if (rate > 0)
+                    {
+                        _incoming.TryGetValue(x, out double r);
+                        _incoming[x] = r + rate * share;
+                    }
+                    else if (!_eventTriggeredBy.ContainsKey(x))
+                    {
+                        _eventTriggeredBy[x] = NameOf(t);
+                    }
+                }
+            }
+        }
+
+        private static List<Building> Candidates(Building t)
+        {
+            Triggerer cfg = Triggerers[t.Tag];
+            HashSet<Tile> tiles = cfg.Area == Area.Range ? t.GetTilesInRange() : t.GetAdjacentTiles();
+            GamePieceCategory[] cats = cfg.UseCategories ? t.Behaviour.GetTargetCategories(t) : null;
+            var list = new List<Building>();
+            foreach (Tile tile in tiles)
+            {
+                if (tile == null || tile.IsEmpty)
+                    continue;
+                Building x = tile.Building;
+                if (x == null || x == t || x.Tag == t.Tag || !x.Behaviour.CanBeActivated(x))
+                    continue;
+                if (cats != null && cats.Length > 0 && !x.Categories.ContainsAnyOf(cats))
+                    continue;
+                if (!list.Contains(x))
+                    list.Add(x);
+            }
+            return list;
+        }
+
+        private static double Share(Building t, List<Building> targets)
+        {
+            if (targets.Count == 0)
+                return 0;
+            if (Triggerers[t.Tag].All)
+                return 1;
+            return Math.Min(1.0, Math.Max(1, t.Behaviour.GetActivationCount(t)) / (double)targets.Count);
+        }
+
+        private static bool HasCountdown(Building b) => b.GamePieceWithCount != null && b.Cooldown > 0;
+
+        private static double OwnRate(Building b) => HasCountdown(b) ? 1.0 / b.Cooldown : 0;
+
+        // Points per activation (the game's preview) times activations.
+        private static double PointsPerActivation(Building b) =>
+            PlacementScores.PreviewTotal(b, 1.0) * Math.Max(1, b.Behaviour.GetActivationCount(b));
+
+        // Points per turn the building is responsible for: its own (on its countdown plus triggers from neighbours)
+        // and, for a building that triggers others, the points of the activations it hands out. Falls back to points
+        // per activation for a building only event-driven neighbours trigger. False if neither applies.
+        private bool Attributed(Building b, out double value, out bool perTurn)
+        {
+            double own = OwnRate(b);
+            _incoming.TryGetValue(b, out double incoming);
+            double rate = own + incoming;
+            double points = PointsPerActivation(b);
+            value = points * rate;
+            double delivered = 0;
+            if (Triggerers.ContainsKey(b.Tag) && own > 0)
+            {
+                List<Building> targets = Candidates(b);
+                double share = Share(b, targets);
+                foreach (Building x in targets)
+                    if (_points.TryGetValue(x, out double p))
+                        delivered += own * share * p;
+            }
+            value += delivered;
+            perTurn = true;
+            if (rate > 0 || delivered > 0)
+                return true;
+            if (_eventTriggeredBy.ContainsKey(b))
+            {
+                value = points;
+                perTurn = false;
+                return true;
+            }
+            return false;
         }
 
         private GUIStyle _bigStyle;
@@ -241,7 +371,7 @@ namespace CombolandsTweaks
                 double gain = r.After - r.Now;
                 _bigStyle.normal.textColor = ColourFor(gain);
                 DrawFitted(new Rect(box.x, box.y, box.width, bigH), $"{(gain > 0 ? "+" : "")}{Format(gain)}", _bigStyle, bigH);
-                DrawFitted(new Rect(box.x, box.y + bigH, box.width, smallH), $"{Format(r.Now)}→{Format(r.After)}", _smallStyle, smallH);
+                DrawFitted(new Rect(box.x, box.y + bigH, box.width, smallH), $"{Format(r.Now)}→{Format(r.After)}{(r.PerTurn ? "" : "/act")}", _smallStyle, smallH);
             }
 
             DrawTopList(scale);
@@ -264,7 +394,7 @@ namespace CombolandsTweaks
         private void DrawTopList(float scale)
         {
             var top = new List<KeyValuePair<Building, Row>>(_rows);
-            top.RemoveAll(e => e.Key == null || e.Value.After - e.Value.Now <= 0);
+            top.RemoveAll(e => e.Key == null || !e.Value.PerTurn || e.Value.After - e.Value.Now <= 0);
             if (top.Count == 0)
                 return;
             top.Sort((a, b) => (b.Value.After - b.Value.Now).CompareTo(a.Value.After - a.Value.Now));
@@ -290,7 +420,17 @@ namespace CombolandsTweaks
         private void DrawTooltip(Building b, Row r, Vector2 mouse, float scale)
         {
             double gain = r.After - r.Now;
-            _content.text = $"{NameOf(b)}\n{Format(r.Now)} → <color={Hex(ColourFor(gain))}>{Format(r.After)}</color> points per turn (activates every {b.Cooldown} turns)";
+            string how;
+            if (!r.PerTurn)
+                how = $"points per activation (triggered by {(_eventTriggeredBy.TryGetValue(b, out string by) ? by : "a neighbour")} when it reacts)";
+            else
+            {
+                _incoming.TryGetValue(b, out double incoming);
+                how = "points per turn (" + (HasCountdown(b) ? $"every {b.Cooldown} turns" : "no countdown")
+                      + (incoming > 0 ? $", +{incoming:0.##} triggers/turn from neighbours" : "")
+                      + (Triggerers.ContainsKey(b.Tag) && HasCountdown(b) ? ", incl. what it triggers" : "") + ")";
+            }
+            _content.text = $"{NameOf(b)}\n{Format(r.Now)} → <color={Hex(ColourFor(gain))}>{Format(r.After)}</color> {how}";
             _panelStyle.fontSize = Mathf.Clamp(Mathf.RoundToInt(15 * scale), 10, 30);
             Vector2 size = _panelStyle.CalcSize(_content);
             var rect = new Rect(mouse.x + 20f, mouse.y + 20f, size.x + 12f, size.y + 8f);
