@@ -20,8 +20,11 @@ namespace CombolandsTweaks
     // preview re-run, and the change undone.
     internal class UpgradePreview : MonoBehaviour
     {
-        private const float RefreshInterval = 0.5f;
         private const float FindInterval = 0.5f;
+
+        // Each candidate building costs a few previews (paints: of every building around it too), so the work is
+        // spread over frames and only redone when the upgrade or the board changes.
+        private const double FrameBudgetMs = 2.0;
 
         private struct Row
         {
@@ -31,11 +34,25 @@ namespace CombolandsTweaks
             public int Affected; // paints: other buildings whose points change
         }
 
-        private readonly Dictionary<Building, Row> _rows = new Dictionary<Building, Row>();
+        private Dictionary<Building, Row> _rows = new Dictionary<Building, Row>();
         private double _bestGain;
         private GameTag _shownTag = GameTag.None;
-        private float _nextRefresh;
+        private int _shownBoard;
         private bool _loggedError;
+
+        // The calculation in progress; its rows replace _rows when it finishes.
+        private bool _jobActive;
+        private GameTag _jobTag;
+        private float _jobAmount;
+        private readonly List<Building> _jobBuildings = new List<Building>();
+        private int _jobIndex;
+        private Dictionary<Building, Row> _jobRows = new Dictionary<Building, Row>();
+        private double _jobBest;
+        // Each building's points per turn before any change, worked out once per job (NaN = no figure).
+        private readonly Dictionary<Building, double> _before = new Dictionary<Building, double>();
+        // Paints: buildings whose range or adjacency covers each tile.
+        private readonly Dictionary<Tile, List<Building>> _watchers = new Dictionary<Tile, List<Building>>();
+        private readonly List<Building> _townHalls = new List<Building>();
 
         private Consumable[] _consumables = Array.Empty<Consumable>();
         private ShopSingle[] _shopItems = Array.Empty<ShopSingle>();
@@ -66,18 +83,30 @@ namespace CombolandsTweaks
         private void Update()
         {
             GameTag tag = Plugin.UpgradePreviewEnabled.Value ? FindUpgrade() : GameTag.None;
-            Showing = tag != GameTag.None && _rows.Count > 0;
-            if (tag == GameTag.None)
+            if (tag == GameTag.None || !MonoSingleton<BuildingController>.HasInstance)
             {
                 _rows.Clear();
+                _jobActive = false;
                 _shownTag = GameTag.None;
+                Showing = false;
                 return;
             }
-            if (tag == _shownTag && Time.unscaledTime < _nextRefresh)
-                return;
-            _shownTag = tag;
-            _nextRefresh = Time.unscaledTime + RefreshInterval;
-            Compute(tag);
+
+            int board = PlacementScores.BoardSignature();
+            if (tag != _shownTag)
+            {
+                // Never show one upgrade's numbers for another while the new ones are worked out.
+                _rows.Clear();
+                _bestGain = 0;
+            }
+            if (tag != _shownTag || board != _shownBoard)
+            {
+                StartJob(tag);
+                _shownTag = tag;
+                _shownBoard = board;
+            }
+            if (_jobActive)
+                StepJob();
             Showing = _rows.Count > 0;
         }
 
@@ -128,150 +157,174 @@ namespace CombolandsTweaks
             return RectTransformUtility.RectangleContainsScreenPoint(rt, Input.mousePosition, cam);
         }
 
-        private void Compute(GameTag tag)
+        private void StartJob(GameTag tag)
         {
-            _rows.Clear();
-            _bestGain = 0;
-            if (!MonoSingleton<BuildingController>.HasInstance)
-                return;
-            BuildingExtensions.ResetCaches();
-            BuildTriggerModel();
-            if (IsPaint(tag))
+            _jobActive = false;
+            _jobBuildings.Clear();
+            _jobRows = new Dictionary<Building, Row>();
+            _jobBest = 0;
+            _jobIndex = 0;
+            _before.Clear();
+            _watchers.Clear();
+            _townHalls.Clear();
+            try
             {
-                ComputePaint(tag);
+                BuildingExtensions.ResetCaches();
+                BuildTriggerModel();
+                foreach (Building b in MonoSingleton<BuildingController>.Instance.Buildings)
+                {
+                    if (b == null || b.Values == null || !b.isActiveAndEnabled)
+                        continue;
+                    _jobBuildings.Add(b);
+                    if (IsPaint(tag))
+                    {
+                        if (b.Tag == GameTag.TownHall)
+                            _townHalls.Add(b);
+                        AddWatcher(b, b.GetTilesInRange());
+                        AddWatcher(b, b.GetAdjacentTiles());
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                LogOnce($"Upgrade preview setup for {tag} failed: {e}");
                 return;
             }
-            float amount = ConsumableBehaviour.GetBuildingSupplyParam(tag);
-            foreach (Building b in MonoSingleton<BuildingController>.Instance.Buildings)
+            _jobTag = tag;
+            _jobAmount = IsStatUpgrade(tag) ? ConsumableBehaviour.GetBuildingSupplyParam(tag) : 0f;
+            _jobActive = true;
+        }
+
+        private void AddWatcher(Building w, HashSet<Tile> tiles)
+        {
+            foreach (Tile t in tiles)
             {
-                if (b == null || b.Values == null || !b.isActiveAndEnabled)
+                if (t == null)
+                    continue;
+                if (!_watchers.TryGetValue(t, out List<Building> list))
+                    _watchers[t] = list = new List<Building>();
+                if (!list.Contains(w))
+                    list.Add(w);
+            }
+        }
+
+        private void StepJob()
+        {
+            var frame = System.Diagnostics.Stopwatch.StartNew();
+            while (_jobIndex < _jobBuildings.Count && frame.Elapsed.TotalMilliseconds < FrameBudgetMs)
+            {
+                Building b = _jobBuildings[_jobIndex++];
+                if (b == null)
                     continue;
                 try
                 {
-                    if (!ConsumableBehaviour.CanUseConsumableOn(tag, b.Tile))
+                    Row row;
+                    bool ok = IsPaint(_jobTag) ? PaintRow(b, _jobTag, out row) : StatRow(b, _jobTag, _jobAmount, out row);
+                    if (!ok)
                         continue;
-                    if (tag == GameTag.BsStatModMult && !b.Tag.CanGetMult())
-                        continue;
-                    Row row = default;
-                    // Buildings that never activate on their own and that nothing nearby triggers have no
-                    // meaningful figure, so they're left out.
-                    if (!Attributed(b, out row.Now, out row.PerTurn))
-                        continue;
-                    Apply(b, tag, amount);
-                    try
-                    {
-                        PlacementScores.ForgetCaches(b);
-                        Attributed(b, out row.After, out _);
-                    }
-                    finally
-                    {
-                        Apply(b, tag, -amount);
-                        PlacementScores.ForgetCaches(b);
-                    }
-                    if (row.Now == 0 && row.After == 0)
-                        continue;
-                    _rows[b] = row;
-                    if (row.After - row.Now > _bestGain)
-                        _bestGain = row.After - row.Now;
+                    _jobRows[b] = row;
+                    if (row.After - row.Now > _jobBest)
+                        _jobBest = row.After - row.Now;
                 }
                 catch (Exception e)
                 {
-                    if (!_loggedError)
-                    {
-                        _loggedError = true;
-                        Plugin.Log.LogError($"Upgrade preview for {b.Tag} at {b.X},{b.Y} failed: {e}");
-                    }
+                    LogOnce($"Upgrade preview for {b.Tag} at {b.X},{b.Y} failed: {e}");
                 }
             }
+            if (_jobIndex < _jobBuildings.Count)
+                return;
+            _jobActive = false;
+            (_rows, _jobRows) = (_jobRows, _rows);
+            _bestGain = _jobBest;
+        }
+
+        private void LogOnce(string message)
+        {
+            if (_loggedError)
+                return;
+            _loggedError = true;
+            Plugin.Log.LogError(message);
+        }
+
+        // Points per turn before any change, memoised for the job.
+        private double Before(Building x)
+        {
+            if (!_before.TryGetValue(x, out double v))
+                _before[x] = v = Attributed(x, out double value, out _) ? value : double.NaN;
+            return v;
+        }
+
+        private bool StatRow(Building b, GameTag tag, float amount, out Row row)
+        {
+            row = default;
+            if (!ConsumableBehaviour.CanUseConsumableOn(tag, b.Tile))
+                return false;
+            if (tag == GameTag.BsStatModMult && !b.Tag.CanGetMult())
+                return false;
+            // Buildings that never activate on their own and that nothing nearby triggers have no meaningful figure.
+            if (!Attributed(b, out row.Now, out row.PerTurn))
+                return false;
+            Apply(b, tag, amount);
+            try
+            {
+                PlacementScores.ForgetCaches(b);
+                Attributed(b, out row.After, out _);
+            }
+            finally
+            {
+                Apply(b, tag, -amount);
+                PlacementScores.ForgetCaches(b);
+            }
+            return row.Now != 0 || row.After != 0;
         }
 
         // A paint changes how other buildings see the painted one (a Wild building counts as every category), so the
         // figure is the points per turn of the painted building plus every building whose range or adjacency covers it.
-        private void ComputePaint(GameTag paint)
+        private bool PaintRow(Building b, GameTag paint, out Row row)
         {
-            List<Building> all = MonoSingleton<BuildingController>.Instance.Buildings;
-            var watchers = new Dictionary<Tile, List<Building>>();
-            var townHalls = new List<Building>();
-            foreach (Building w in all)
+            row = default;
+            if (b.BuildingPaint == null || !ConsumableBehaviour.CanUseConsumableOn(paint, b.Tile))
+                return false;
+            var affected = new List<Building> { b };
+            if (_watchers.TryGetValue(b.Tile, out List<Building> seeing))
+                foreach (Building w in seeing)
+                    if (!affected.Contains(w))
+                        affected.Add(w);
+            foreach (Building w in _townHalls)
+                if (!affected.Contains(w))
+                    affected.Add(w);
+
+            row.PerTurn = true;
+            row.Affected = affected.Count - 1;
+            foreach (Building x in affected)
             {
-                if (w == null || w.Values == null || !w.isActiveAndEnabled)
-                    continue;
-                if (w.Tag == GameTag.TownHall)
-                    townHalls.Add(w);
-                foreach (HashSet<Tile> tiles in new[] { w.GetTilesInRange(), w.GetAdjacentTiles() })
-                    foreach (Tile t in tiles)
-                    {
-                        if (t == null)
-                            continue;
-                        if (!watchers.TryGetValue(t, out List<Building> list))
-                            watchers[t] = list = new List<Building>();
-                        if (!list.Contains(w))
-                            list.Add(w);
-                    }
+                double v = Before(x);
+                if (!double.IsNaN(v))
+                    row.Now += v;
             }
 
-            foreach (Building b in all)
+            GameTag oldPaint = PaintTag(b.BuildingPaint);
+            GamePieceCategory oldMajor = MajorOverride(b.Values);
+            PaintTag(b.BuildingPaint) = paint;
+            if (paint == GameTag.BsRainbowPaint)
+                MajorOverride(b.Values) = GamePieceCategory.Wild;
+            try
             {
-                if (b == null || b.Values == null || b.BuildingPaint == null || !b.isActiveAndEnabled)
-                    continue;
-                try
-                {
-                    if (!ConsumableBehaviour.CanUseConsumableOn(paint, b.Tile))
-                        continue;
-                    var affected = new List<Building> { b };
-                    if (watchers.TryGetValue(b.Tile, out List<Building> seeing))
-                        foreach (Building w in seeing)
-                            if (!affected.Contains(w))
-                                affected.Add(w);
-                    foreach (Building w in townHalls)
-                        if (!affected.Contains(w))
-                            affected.Add(w);
-
-                    Row row = default;
-                    row.PerTurn = true;
-                    row.Affected = affected.Count - 1;
-                    row.Now = SumAttributed(affected);
-
-                    GameTag oldPaint = PaintTag(b.BuildingPaint);
-                    GamePieceCategory oldMajor = MajorOverride(b.Values);
-                    PaintTag(b.BuildingPaint) = paint;
-                    if (paint == GameTag.BsRainbowPaint)
-                        MajorOverride(b.Values) = GamePieceCategory.Wild;
-                    try
-                    {
-                        BuildingExtensions.ResetCaches();
-                        row.After = SumAttributed(affected);
-                    }
-                    finally
-                    {
-                        PaintTag(b.BuildingPaint) = oldPaint;
-                        MajorOverride(b.Values) = oldMajor;
-                        BuildingExtensions.ResetCaches();
-                    }
-                    if (Math.Abs(row.After - row.Now) < 0.05)
-                        continue;
-                    _rows[b] = row;
-                    if (row.After - row.Now > _bestGain)
-                        _bestGain = row.After - row.Now;
-                }
-                catch (Exception e)
-                {
-                    if (!_loggedError)
-                    {
-                        _loggedError = true;
-                        Plugin.Log.LogError($"Paint preview for {b.Tag} at {b.X},{b.Y} failed: {e}");
-                    }
-                }
+                // Only these buildings' cached ranges, adjacency counts and categories can change.
+                foreach (Building x in affected)
+                    PlacementScores.ForgetCaches(x);
+                foreach (Building x in affected)
+                    if (Attributed(x, out double v, out _))
+                        row.After += v;
             }
-        }
-
-        private double SumAttributed(List<Building> buildings)
-        {
-            double sum = 0;
-            foreach (Building x in buildings)
-                if (Attributed(x, out double v, out _))
-                    sum += v;
-            return sum;
+            finally
+            {
+                PaintTag(b.BuildingPaint) = oldPaint;
+                MajorOverride(b.Values) = oldMajor;
+                foreach (Building x in affected)
+                    PlacementScores.ForgetCaches(x);
+            }
+            return Math.Abs(row.After - row.Now) >= 0.05;
         }
 
         // Only the stored change: no notification text, effects or quest progress like AddLocalStatChange.

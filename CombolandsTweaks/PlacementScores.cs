@@ -223,7 +223,7 @@ namespace CombolandsTweaks
         }
 
         // Cheap fingerprint of the board so the overlay recomputes after a building is placed, moved or removed.
-        private static int BoardSignature()
+        internal static int BoardSignature()
         {
             if (!MonoSingleton<BuildingController>.HasInstance)
                 return 0;
