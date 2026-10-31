@@ -38,7 +38,6 @@ namespace CombolandsTweaks
         private ShopSingle[] _shopItems = Array.Empty<ShopSingle>();
         private float _nextFind;
 
-        private GUIStyle _style;
 
         internal static bool Showing;
 
@@ -128,6 +127,10 @@ namespace CombolandsTweaks
                         continue;
                     Row row = default;
                     row.PerTurn = b.GamePieceWithCount != null && b.Cooldown > 0;
+                    // Buildings without a countdown only score when something else triggers them, so a per-turn
+                    // figure doesn't exist for them.
+                    if (!row.PerTurn)
+                        continue;
                     row.Now = PointsPerTurn(b, row.PerTurn);
                     Apply(b, tag, amount);
                     try
@@ -185,6 +188,11 @@ namespace CombolandsTweaks
             return perTurn ? points / Math.Max(1, b.Cooldown) : points;
         }
 
+        private GUIStyle _bigStyle;
+        private GUIStyle _smallStyle;
+        private GUIStyle _panelStyle;
+        private readonly GUIContent _content = new GUIContent();
+
         private void OnGUI()
         {
             if (_rows.Count == 0 || Event.current.type != EventType.Repaint)
@@ -195,27 +203,125 @@ namespace CombolandsTweaks
             float tilePx = Mathf.Abs(cam.WorldToScreenPoint(Vector3.right).x - cam.WorldToScreenPoint(Vector3.zero).x);
             if (tilePx < 8f)
                 return;
-            if (_style == null)
-                _style = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.MiddleCenter, fontStyle = FontStyle.Bold, wordWrap = false, richText = true };
-            _style.fontSize = Mathf.Clamp(Mathf.RoundToInt(tilePx * 0.22f * Plugin.ScoreTextScale.Value), 9, 40);
+            if (_bigStyle == null)
+            {
+                _bigStyle = new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, fontStyle = FontStyle.Bold, wordWrap = false, clipping = TextClipping.Clip, padding = new RectOffset() };
+                _smallStyle = new GUIStyle(_bigStyle) { fontStyle = FontStyle.Normal };
+                _smallStyle.normal.textColor = new Color(0.85f, 0.85f, 0.85f);
+                _panelStyle = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.UpperLeft, wordWrap = false, richText = true, fontStyle = FontStyle.Bold };
+                _panelStyle.normal.textColor = Color.white;
+            }
 
+            // Each label stays inside its own tile (top part, clear of the game's count numbers), so labels of
+            // neighbouring buildings can never overlap.
+            float scale = Plugin.ScoreTextScale.Value;
+            float width = tilePx * 0.94f;
+            float bigH = tilePx * 0.3f * scale, smallH = tilePx * 0.21f * scale;
+            Vector2 mouse = new Vector2(Input.mousePosition.x, Screen.height - Input.mousePosition.y);
+            Building hovered = null;
+            Color old = GUI.color;
             foreach (KeyValuePair<Building, Row> entry in _rows)
             {
                 Building b = entry.Key;
                 if (b == null)
                     continue;
                 Row r = entry.Value;
-                double gain = r.After - r.Now;
-                string colour = gain > 0 && Math.Abs(gain - _bestGain) < 0.001 ? "#FFD633" : gain > 0 ? "#66FF66" : gain < 0 ? "#FF7366" : "#DDDDDD";
-                string text = $"{Format(r.Now)} → <color={colour}>{Format(r.After)}</color>{(r.PerTurn ? "/turn" : "/act")}";
-                Vector2 size = _style.CalcSize(new GUIContent(text));
-                Vector3 screen = cam.WorldToScreenPoint(new Vector3(b.X, b.Y + 0.55f));
-                if (screen.z < 0f)
+                Vector3 c = cam.WorldToScreenPoint(new Vector3(b.X, b.Y));
+                if (c.z < 0f)
                     continue;
-                GUI.Box(new Rect(screen.x - size.x / 2f - 3f, Screen.height - screen.y - size.y, size.x + 6f, size.y + 2f), text, _style);
+                var tile = new Rect(c.x - tilePx / 2f, Screen.height - c.y - tilePx / 2f, tilePx, tilePx);
+                if (tile.Contains(mouse))
+                    hovered = b;
+
+                var box = new Rect(c.x - width / 2f, tile.y + tilePx * 0.03f, width, bigH + smallH + 2f);
+                GUI.color = new Color(0.05f, 0.05f, 0.08f, 0.85f);
+                GUI.DrawTexture(box, Texture2D.whiteTexture);
+                GUI.color = old;
+
+                double gain = r.After - r.Now;
+                _bigStyle.normal.textColor = ColourFor(gain);
+                DrawFitted(new Rect(box.x, box.y, box.width, bigH), $"{(gain > 0 ? "+" : "")}{Format(gain)}", _bigStyle, bigH);
+                DrawFitted(new Rect(box.x, box.y + bigH, box.width, smallH), $"{Format(r.Now)}→{Format(r.After)}", _smallStyle, smallH);
             }
+
+            DrawTopList(scale);
+            if (hovered != null)
+                DrawTooltip(hovered, _rows[hovered], mouse, scale);
         }
 
-        private static string Format(double v) => Math.Abs(v - Math.Round(v)) < 0.05 ? Math.Round(v).ToString("0") : v.ToString("0.0");
+        // Shrinks the font until the text fits the width.
+        private void DrawFitted(Rect rect, string text, GUIStyle style, float height)
+        {
+            _content.text = text;
+            int size = Mathf.Clamp(Mathf.RoundToInt(height * 0.9f), 6, 48);
+            style.fontSize = size;
+            while (size > 6 && style.CalcSize(_content).x > rect.width)
+                style.fontSize = --size;
+            GUI.Label(rect, _content, style);
+        }
+
+        // Fixed list on the left: the five buildings that gain most from the upgrade.
+        private void DrawTopList(float scale)
+        {
+            var top = new List<KeyValuePair<Building, Row>>(_rows);
+            top.RemoveAll(e => e.Key == null || e.Value.After - e.Value.Now <= 0);
+            if (top.Count == 0)
+                return;
+            top.Sort((a, b) => (b.Value.After - b.Value.Now).CompareTo(a.Value.After - a.Value.Now));
+            var sb = new System.Text.StringBuilder("Best buildings for this upgrade (points per turn)\n");
+            for (int i = 0; i < top.Count && i < 5; i++)
+            {
+                Row r = top[i].Value;
+                double gain = r.After - r.Now;
+                sb.Append($"\n{i + 1}. {NameOf(top[i].Key)}  <color={Hex(ColourFor(gain))}>+{Format(gain)}</color>  ({Format(r.Now)} → {Format(r.After)})");
+            }
+            _panelStyle.fontSize = Mathf.Clamp(Mathf.RoundToInt(15 * scale), 10, 30);
+            _content.text = sb.ToString();
+            Vector2 size = _panelStyle.CalcSize(_content);
+            GUI.color = new Color(1f, 1f, 1f, 1f);
+            Rect rect = new Rect(16f, Screen.height * 0.22f, size.x + 12f, size.y + 8f);
+            Color old = GUI.color;
+            GUI.color = new Color(0.05f, 0.05f, 0.08f, 0.9f);
+            GUI.DrawTexture(rect, Texture2D.whiteTexture);
+            GUI.color = old;
+            GUI.Label(new Rect(rect.x + 6f, rect.y + 4f, size.x, size.y), _content, _panelStyle);
+        }
+
+        private void DrawTooltip(Building b, Row r, Vector2 mouse, float scale)
+        {
+            double gain = r.After - r.Now;
+            _content.text = $"{NameOf(b)}\n{Format(r.Now)} → <color={Hex(ColourFor(gain))}>{Format(r.After)}</color> points per turn (activates every {b.Cooldown} turns)";
+            _panelStyle.fontSize = Mathf.Clamp(Mathf.RoundToInt(15 * scale), 10, 30);
+            Vector2 size = _panelStyle.CalcSize(_content);
+            var rect = new Rect(mouse.x + 20f, mouse.y + 20f, size.x + 12f, size.y + 8f);
+            if (rect.xMax > Screen.width)
+                rect.x = mouse.x - rect.width - 10f;
+            if (rect.yMax > Screen.height)
+                rect.y = mouse.y - rect.height - 10f;
+            Color old = GUI.color;
+            GUI.color = new Color(0.05f, 0.05f, 0.08f, 0.95f);
+            GUI.DrawTexture(rect, Texture2D.whiteTexture);
+            GUI.color = old;
+            GUI.Label(new Rect(rect.x + 6f, rect.y + 4f, size.x, size.y), _content, _panelStyle);
+        }
+
+        private Color ColourFor(double gain)
+        {
+            if (gain > 0 && Math.Abs(gain - _bestGain) < 0.001)
+                return new Color(1f, 0.84f, 0.2f);
+            if (gain > 0)
+                return new Color(0.4f, 1f, 0.4f);
+            if (gain < 0)
+                return new Color(1f, 0.45f, 0.4f);
+            return new Color(0.85f, 0.85f, 0.85f);
+        }
+
+        private static string Hex(Color c) => "#" + ColorUtility.ToHtmlStringRGB(c);
+
+        private static string NameOf(Building b) =>
+            Framework.ScriptableObjectSingleton<StringLookup>.Instance.GetNameForTag(b.Tag, out string name) ? name : b.Tag.ToString();
+
+        // Whole numbers from 10 up keep the labels short.
+        private static string Format(double v) => Math.Abs(v) >= 10 || Math.Abs(v - Math.Round(v)) < 0.05 ? Math.Round(v).ToString("0") : v.ToString("0.0");
     }
 }
