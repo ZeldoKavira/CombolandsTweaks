@@ -306,7 +306,8 @@ namespace CombolandsTweaks
             _passBoard = _board;
             _passNearby = _nearby;
             _passPerTurn = _perTurn;
-            _passFactor = key.Consumable == GameTag.BsNegMult ? 0.5 : 1.0;
+            // Card drawbacks are applied as stat changes in ScoreAt (the game's own preview just halves for -mult).
+            _passFactor = 1.0;
             _passActive = true;
             _passTime.Start();
             BuildingExtensions.ResetCaches();
@@ -534,26 +535,39 @@ namespace CombolandsTweaks
 
                 // Mult the new building gets on being built (BuildBuildingAt), which the game's preview leaves out.
                 float bonusMult = PlacementMultBonus(tile, out score.Note);
-                if (bonusMult != 0f && probe.Tag.CanGetMult())
-                {
-                    LocalMult(probe.Values) += bonusMult;
-                    ForgetCaches(probe);
-                    try
-                    {
-                        score.Own = OwnValue(probe);
-                        score.Once = OnceValue(probe);
-                    }
-                    finally
-                    {
-                        LocalMult(probe.Values) -= bonusMult;
-                        ForgetCaches(probe);
-                    }
-                }
-                else
+                if (!probe.Tag.CanGetMult())
+                    bonusMult = 0f;
+                // The card's drawback (PlacingBuilding.ApplyConsumableWhenCreated): a local stat change on the new
+                // building, applied the same way here.
+                CardPenalty(_passKey.Consumable, out float penaltyMult, out int penaltyCooldown, out int penaltyRange);
+                if (!probe.Tag.CanGetMult())
+                    penaltyMult = 0f;
+                float mult = bonusMult + penaltyMult;
+                LocalMult(probe.Values) += mult;
+                LocalCooldown(probe.Values) += penaltyCooldown;
+                LocalRange(probe.Values) += penaltyRange;
+                ForgetCaches(probe);
+                try
                 {
                     score.Own = OwnValue(probe);
                     score.Once = OnceValue(probe);
                 }
+                finally
+                {
+                    LocalMult(probe.Values) -= mult;
+                    LocalCooldown(probe.Values) -= penaltyCooldown;
+                    LocalRange(probe.Values) -= penaltyRange;
+                    ForgetCaches(probe);
+                }
+                if (penaltyMult != 0f || penaltyCooldown != 0 || penaltyRange != 0)
+                    score.Note = Join(score.Note, "card drawback: " + string.Join(", ", new[]
+                    {
+                        penaltyMult != 0f ? $"{penaltyMult:0.##} mult" : null,
+                        penaltyCooldown != 0 ? $"+{penaltyCooldown} cooldown" : null,
+                        penaltyRange != 0 ? $"{penaltyRange} range" : null,
+                    }.Where(x => x != null)));
+                if (_passKey.Consumable == GameTag.BsNegBlackPaint)
+                    score.Note = Join(score.Note, $"black paint: removed after {ConsumableBehaviour.GetPaintCooldownParam(GameTag.BsNegBlackPaint)} turns");
                 if (_passPerTurn && OwnRate(probe) <= 0 && score.Once < 0.5)
                 {
                     long per = PreviewTotal(probe, _passFactor);
@@ -612,6 +626,32 @@ namespace CombolandsTweaks
             {
                 LogOnce($"Scoring {probe.Tag} at {tile.X},{tile.Y} failed: {e}");
                 return false;
+            }
+        }
+
+        internal static readonly AccessTools.FieldRef<GamePieceLocalValues, int> LocalCooldown =
+            AccessTools.FieldRefAccess<GamePieceLocalValues, int>("_localCooldownChanges");
+        internal static readonly AccessTools.FieldRef<GamePieceLocalValues, int> LocalRange =
+            AccessTools.FieldRefAccess<GamePieceLocalValues, int>("_localRangeChanges");
+
+        // A card can come with a drawback applied when built: BsNegMult (-0.5 mult), BsNegCooldown (+1 cooldown),
+        // BsNegRange (-1 range), each a local stat change (ConsumableBehaviour.GetBuildingSupplyParam).
+        private static void CardPenalty(GameTag consumable, out float mult, out int cooldown, out int range)
+        {
+            mult = 0f;
+            cooldown = 0;
+            range = 0;
+            switch (consumable)
+            {
+                case GameTag.BsNegMult:
+                    mult = ConsumableBehaviour.GetBuildingSupplyParam(consumable);
+                    break;
+                case GameTag.BsNegCooldown:
+                    cooldown = Mathf.RoundToInt(ConsumableBehaviour.GetBuildingSupplyParam(consumable));
+                    break;
+                case GameTag.BsNegRange:
+                    range = Mathf.RoundToInt(ConsumableBehaviour.GetBuildingSupplyParam(consumable));
+                    break;
             }
         }
 
