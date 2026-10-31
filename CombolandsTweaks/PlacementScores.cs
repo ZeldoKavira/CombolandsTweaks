@@ -34,6 +34,7 @@ namespace CombolandsTweaks
         {
             public long Own;
             public long Nearby;
+            public string Note; // placement bonus that applied (Scaffolding, Nesting Doll, ...)
             public long Total => Own + Nearby;
         }
 
@@ -365,13 +366,50 @@ namespace CombolandsTweaks
                 probe.transform.position = new Vector3(tile.X, tile.Y);
                 ForgetCaches(probe);
 
-                if (!controller.CanBuildBuildingAt(probe, tile.X, tile.Y, out CantPlaceBuildingReason reason)
-                    || reason == CantPlaceBuildingReason.NestingDolls)
+                if (!controller.CanBuildBuildingAt(probe, tile.X, tile.Y, out CantPlaceBuildingReason reason))
                     return false;
 
-                score.Own = PreviewTotal(probe, _passFactor);
+                // Nesting Doll: nothing is built; the existing copy gets extra mult instead (BuildBuildingAt).
+                if (reason == CantPlaceBuildingReason.NestingDolls)
+                {
+                    float dollMult = MonoSingleton<ItemHeirloomController>.Instance.GetItemWithTagEquipped(GameTag.NestingDoll).Behaviour.GetMultParam(null);
+                    score.Own = MultGain(tile.Building, dollMult);
+                    score.Note = $"Nesting Doll: +{dollMult:0.##} mult to the {NameOf(tile.Building.Tag)} here";
+                    return true;
+                }
+
+                // Mult the new building gets on being built (BuildBuildingAt), which the game's preview leaves out.
+                float bonusMult = PlacementMultBonus(tile, out score.Note);
+                if (bonusMult != 0f && probe.Tag.CanGetMult())
+                {
+                    LocalMult(probe.Values) += bonusMult;
+                    ForgetCaches(probe);
+                    try
+                    {
+                        score.Own = PreviewTotal(probe, _passFactor);
+                    }
+                    finally
+                    {
+                        LocalMult(probe.Values) -= bonusMult;
+                        ForgetCaches(probe);
+                    }
+                }
+                else
+                {
+                    score.Own = PreviewTotal(probe, _passFactor);
+                }
+
                 if (_passNearby)
+                {
                     score.Nearby = NearbyGain(probe, tile);
+                    score.Nearby += InventorGain(probe, tile, ref score.Note);
+                    // A scoring building that gets built over is lost.
+                    if (tile.Building != null && _baseline.TryGetValue(tile.Building, out long lost) && lost != 0)
+                    {
+                        score.Nearby -= lost;
+                        score.Note = Join(score.Note, $"replaces a {NameOf(tile.Building.Tag)} ({lost})");
+                    }
+                }
                 return true;
             }
             catch (Exception e)
@@ -380,6 +418,74 @@ namespace CombolandsTweaks
                 return false;
             }
         }
+
+        internal static readonly AccessTools.FieldRef<GamePieceLocalValues, float> LocalMult =
+            AccessTools.FieldRefAccess<GamePieceLocalValues, float>("_localMultiplierChanges");
+
+        // Scaffolding under the tile, and Checkered Flag on the run's first building.
+        private static float PlacementMultBonus(Tile tile, out string note)
+        {
+            float mult = 0f;
+            note = null;
+            if (tile.Building != null && tile.Building.Tag == GameTag.Scaffolding)
+            {
+                float m = tile.Building.Behaviour.GetMultParam(tile.Building);
+                mult += m;
+                note = Join(note, $"Scaffolding +{m:0.##} mult");
+            }
+            if (MonoSingleton<GameController>.HasInstance && !MonoSingleton<GameController>.Instance.FirstBuildingBuilt
+                && MonoSingleton<ItemHeirloomController>.HasInstance
+                && MonoSingleton<ItemHeirloomController>.Instance.IsItemWithTagEquipped(GameTag.CheckeredFlag))
+            {
+                float m = MonoSingleton<ItemHeirloomController>.Instance.GetCountOfItemWithTagEquipped(GameTag.CheckeredFlag)
+                          * Entities.ItemBehaviours.ItemBehaviours.Instance.GetBehaviourFor(GameTag.CheckeredFlag).GetMultParam(null);
+                mult += m;
+                note = Join(note, $"Checkered Flag +{m:0.##} mult");
+            }
+            return mult;
+        }
+
+        // Inventor with 4+ council votes: an Engineering building gives every adjacent building extra mult on build.
+        private long InventorGain(Building probe, Tile tile, ref string note)
+        {
+            if (!SerializedMonoSingleton<CouncilFavour>.HasInstance || !probe.Categories.ContainsCategory(GamePieceCategory.Engineering))
+                return 0;
+            CouncilFavour council = SerializedMonoSingleton<CouncilFavour>.Instance;
+            if (council.GetVotesFor(CouncilCharacter.Inventor) < 4)
+                return 0;
+            float mult = council.GetMultParamFor(CouncilCharacter.Inventor);
+            long gain = 0;
+            foreach (Tile t in probe.GetAdjacentTiles())
+                if (t != null && t != tile && !t.IsEmpty && t.Building != null)
+                    gain += MultGain(t.Building, mult);
+            if (gain != 0)
+                note = Join(note, $"Inventor +{mult:0.##} mult to neighbours");
+            return gain;
+        }
+
+        // What extra mult adds to an existing building's preview points.
+        private static long MultGain(Building b, float mult)
+        {
+            if (b == null || b.Values == null || !b.Tag.CanGetMult())
+                return 0;
+            long before = PreviewTotal(b, 1.0);
+            LocalMult(b.Values) += mult;
+            ForgetCaches(b);
+            try
+            {
+                return PreviewTotal(b, 1.0) - before;
+            }
+            finally
+            {
+                LocalMult(b.Values) -= mult;
+                ForgetCaches(b);
+            }
+        }
+
+        private static string Join(string a, string b) => string.IsNullOrEmpty(a) ? b : a + ", " + b;
+
+        private static string NameOf(GameTag tag) =>
+            ScriptableObjectSingleton<StringLookup>.Instance.GetNameForTag(tag, out string name) ? name : tag.ToString();
 
         // The game's green placement number: the building's preview points times its multiplier.
         internal static long PreviewTotal(Building b, double factor)
@@ -647,11 +753,13 @@ namespace CombolandsTweaks
                     break;
                 }
             }
-            if (hovered == null || r.Scores[hovered].Nearby == 0)
+            if (hovered == null || (r.Scores[hovered].Nearby == 0 && r.Scores[hovered].Note == null))
                 return;
 
             TileScore s = r.Scores[hovered];
-            string text = $"{s.Own} own  {(s.Nearby > 0 ? "+" : "")}{s.Nearby} nearby";
+            string text = s.Nearby != 0 ? $"{s.Own} own  {(s.Nearby > 0 ? "+" : "")}{s.Nearby} nearby" : $"{s.Own}";
+            if (s.Note != null)
+                text += "\n" + s.Note;
             _tipStyle.fontSize = Mathf.Clamp(Mathf.RoundToInt(14 * Plugin.ScoreTextScale.Value), 10, 32);
             Vector2 size = _tipStyle.CalcSize(new GUIContent(text));
             Vector2 mouse = new Vector2(Input.mousePosition.x, Screen.height - Input.mousePosition.y);
