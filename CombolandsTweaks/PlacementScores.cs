@@ -86,6 +86,9 @@ namespace CombolandsTweaks
         private int _cycleIndex = -1;
 
         private Building _probe;
+        // For cards placed as another building (crops: the Empty form), the building it grows into.
+        private Building _grown;
+        private GameTag _grownTag = GameTag.None;
         private GameTag _probeTag = GameTag.None;
         private readonly HashSet<GameTag> _failedProbes = new HashSet<GameTag>();
         private bool _loggedError;
@@ -292,7 +295,7 @@ namespace CombolandsTweaks
             _passTime.Reset();
             if (!SerializedMonoSingleton<MapController>.HasInstance || !MonoSingleton<BuildingController>.HasInstance)
                 return;
-            if (GetProbe(key.Tag) == null)
+            if (GetProbe(PlacedTag(key.Tag)) == null)
             {
                 // Remember the failure so the queue moves on instead of retrying every frame.
                 _results[key] = new Result { Scores = new Dictionary<Tile, TileScore>(), Top = new List<Tile>(), Board = _board, Nearby = _nearby, Time = float.MaxValue };
@@ -458,7 +461,7 @@ namespace CombolandsTweaks
 
         private bool AddGhost(Tile tile)
         {
-            Building ghost = CreateCopy(_passKey.Tag);
+            Building ghost = CreateCopy(PlacedTag(_passKey.Tag));
             if (ghost == null)
                 return false;
             ghost.name = "CombolandsTweaks planned copy";
@@ -524,6 +527,17 @@ namespace CombolandsTweaks
                 if (!controller.CanBuildBuildingAt(probe, tile.X, tile.Y, out CantPlaceBuildingReason reason))
                     return false;
 
+                // Obelisk on Obelisk: nothing is built; the existing one stores +1 and gives its neighbours more mult.
+                if (reason == CantPlaceBuildingReason.Obelisk && tile.Building != null)
+                {
+                    float step = tile.Building.Behaviour.GetMultParam(tile.Building);
+                    foreach (Tile t in tile.Building.GetAdjacentTiles())
+                        if (t != null && t != tile && !t.IsEmpty && t.Building != null && t.Building != tile.Building)
+                            score.Own += MultGain(t.Building, step);
+                    score.Note = $"stacks on the Obelisk: +{step:0.##} mult to its neighbours";
+                    return true;
+                }
+
                 // Nesting Doll: nothing is built; the existing copy gets extra mult instead (BuildBuildingAt).
                 if (reason == CantPlaceBuildingReason.NestingDolls)
                 {
@@ -551,6 +565,8 @@ namespace CombolandsTweaks
                 {
                     score.Own = OwnValue(probe);
                     score.Once = OnceValue(probe);
+                    if (probe.Tag != _passKey.Tag && _passPerTurn)
+                        GrowthValue(probe, tile, mult, penaltyCooldown, penaltyRange, ref score);
                 }
                 finally
                 {
@@ -613,6 +629,27 @@ namespace CombolandsTweaks
                     foreach (string by in _triggeredBy)
                         score.Note = Join(score.Note, by);
                     score.Nearby += InventorGain(probe, tile, ref score.Note);
+                    // A Campfire's +1 mult to its neighbours lasts only until it burns out.
+                    if (probe.Tag == GameTag.Campfire && probe.GamePieceWithCount != null && _passPerTurn)
+                    {
+                        double lit = Math.Min(probe.Cooldown + 1, Horizon());
+                        score.Nearby *= lit / Horizon();
+                        score.Note = Join(score.Note, $"burns out after {probe.Cooldown} turns");
+                    }
+                    // Sewer removes every adjacent non-Infrastructure building when built.
+                    if (probe.Tag == GameTag.Sewer)
+                    {
+                        int gone = 0;
+                        foreach (Tile t in probe.GetAdjacentTiles())
+                            if (t != null && t != tile && !t.IsEmpty && t.Building != null && !t.Building.Categories.ContainsCategory(GamePieceCategory.Infrastructure)
+                                && _baseline.TryGetValue(t.Building, out double v))
+                            {
+                                score.Nearby -= v;
+                                gone++;
+                            }
+                        if (gone > 0)
+                            score.Note = Join(score.Note, $"destroys {gone} adjacent building{(gone == 1 ? "" : "s")}");
+                    }
                     // A scoring building that gets built over is lost.
                     if (tile.Building != null && _baseline.TryGetValue(tile.Building, out double lost) && Math.Abs(lost) >= 0.05)
                     {
@@ -847,7 +884,7 @@ namespace CombolandsTweaks
             {
                 if (t == null || t == x || !UpgradePreview.Triggerers.ContainsKey(t.Tag))
                     continue;
-                double own = t.GamePieceWithCount != null && t.Cooldown > 0 ? 1.0 / t.Cooldown : 0;
+                double own = OwnRate(t);
                 if (own <= 0)
                     continue;
                 List<Building> targets = UpgradePreview.Candidates(t);
@@ -888,6 +925,13 @@ namespace CombolandsTweaks
         {
             if (b.Tag == GameTag.Composter)
                 return ManureRate(b);
+            // Picks ripe bushes every end of turn, no countdown.
+            if (b.Tag == GameTag.BerryPicker)
+                return 1.0;
+            // A countdown alone isn't enough: the building must act on end of turn (ripe crops keep a cooldown param
+            // but only score when they grow or are triggered).
+            if (b.Behaviour?.ValidTriggers == null || !b.Behaviour.ValidTriggers.Contains(TriggerType.OnEndOfTurn))
+                return 0;
             if (b.GamePieceWithCount == null || b.Cooldown <= 0)
                 return 0;
             if (IsIrrigated(b))
@@ -911,6 +955,33 @@ namespace CombolandsTweaks
             // A Banner never activates; its worth is the permanent mult its neighbours get once it's removed.
             if (b.Tag == GameTag.Banner)
                 return grants ? GrantPerTurn(b) : 0;
+            // Berry Picker: every bush in range (ripe or regrowing) is picked once per regrow cycle.
+            if (b.Tag == GameTag.BerryPicker)
+            {
+                double perPick = b.Behaviour.GetScoreForTag(b, GameTag.BerryBush) * b.Multiplier * factor;
+                double total = 0;
+                var seen = new HashSet<Building>();
+                foreach (Tile t in b.GetTilesInRange())
+                    if (t != null && !t.IsEmpty && t.Building != null && (t.Building.Tag == GameTag.BerryBush || t.Building.Tag == GameTag.BerryBushEmpty) && seen.Add(t.Building))
+                        total += perPick / BushCycle(t.Building);
+                return total;
+            }
+            // Hideout: -100 (Fawkes Mask: +100) each time an adjacent building scores, at most 10 times a week.
+            if (b.Tag == GameTag.Hideout)
+            {
+                double scores = 0;
+                foreach (Tile t in b.GetAdjacentTiles())
+                    if (t != null && !t.IsEmpty && t.Building != null && t.Building != b && t.Building.Tag != GameTag.Hideout && PreviewTotal(t.Building, 1.0) > 0)
+                        scores += OwnRate(t.Building);
+                return b.Behaviour.GetScoreParam(b) * b.Multiplier * factor * Math.Min(10, scores);
+            }
+            // Effigy Pyre fires once (triggering every neighbour) and burns itself down: spread over the milestone.
+            if (b.Tag == GameTag.EffigyPyre)
+            {
+                if (b.GamePieceWithCount == null || Horizon() < b.Cooldown)
+                    return 0;
+                return Delivered(b, 1, grants) / Horizon();
+            }
             double rate = OwnRate(b);
             if (rate <= 0)
                 return 0;
@@ -918,14 +989,49 @@ namespace CombolandsTweaks
                     + (grants ? GrantValue(b) : 0)) * rate;
         }
 
+        // A crop placed as its Empty form grows into the card's building after its cooldown (1 next to an Irrigator):
+        // that scores once on growing (OnTransformedInto) and, if the grown building acts every few turns, per turn.
+        private void GrowthValue(Building empty, Tile tile, float mult, int cooldown, int range, ref TileScore score)
+        {
+            Building grown = GetGrown(_passKey.Tag);
+            if (grown == null)
+                return;
+            int delay = empty.GamePieceWithCount != null && empty.Cooldown > 0 ? (IsIrrigated(empty) ? 1 : empty.Cooldown) : 1;
+            grown.transform.position = new Vector3(tile.X, tile.Y);
+            LocalMult(grown.Values) += mult;
+            LocalCooldown(grown.Values) += cooldown;
+            LocalRange(grown.Values) += range;
+            ForgetCaches(grown);
+            try
+            {
+                double once = 0;
+                if (grown.Behaviour?.ValidTriggers != null && grown.Behaviour.ValidTriggers.Contains(TriggerType.OnTransformedInto) && delay <= Horizon())
+                    once = ActivationValue(grown, 1);
+                score.Once += once;
+                score.Own += TurnValue(grown);
+                score.Note = Join(score.Note, $"grows into {NameOf(grown.Tag)} in {delay} turn{(delay == 1 ? "" : "s")}" + (once >= 0.5 ? $" (+{Fmt(once)})" : ""));
+            }
+            finally
+            {
+                LocalMult(grown.Values) -= mult;
+                LocalCooldown(grown.Values) -= cooldown;
+                LocalRange(grown.Values) -= range;
+                ForgetCaches(grown);
+            }
+        }
+
         // Hunting Bow repeats on-build triggers (TriggerController.AddOnBuiltTrigger).
         private static int BuildTriggers() =>
             1 + (MonoSingleton<ItemHeirloomController>.HasInstance && MonoSingleton<ItemHeirloomController>.Instance.IsItemWithTagEquipped(GameTag.HuntingBow) ? 1 : 0);
 
+        // List OnBuild as a valid trigger but their Trigger() never acts on it.
+        private static readonly HashSet<GameTag> NoBuildActivation = new HashSet<GameTag> { GameTag.Vault, GameTag.Windmill };
+
         // Per-turn mode: what the building scores the moment it's built, if it activates on build.
         private double OnceValue(Building probe)
         {
-            if (!_passPerTurn || probe.Behaviour?.ValidTriggers == null || !probe.Behaviour.ValidTriggers.Contains(TriggerType.OnBuild))
+            if (!_passPerTurn || probe.Behaviour?.ValidTriggers == null || !probe.Behaviour.ValidTriggers.Contains(TriggerType.OnBuild)
+                || NoBuildActivation.Contains(probe.Tag))
                 return 0;
             return (PreviewTotal(probe, _passFactor) * Math.Max(1, probe.Behaviour.GetActivationCount(probe)) + Delivered(probe, 1, grants: false))
                    * BuildTriggers();
@@ -964,6 +1070,9 @@ namespace CombolandsTweaks
                     if (category > 0 && !probe.Categories.ContainsCategory(r.Behaviour.GetTargetCategoryByNumber(r, category)))
                         break;
                     double v = ActivationValue(r, 1, grants: false) * BuildTriggers();
+                    // Way Station doesn't activate on construction; its countdown just comes one turn closer.
+                    if (r.Tag == GameTag.WayStation)
+                        v /= Math.Max(1, r.Cooldown);
                     if (v >= 0.5)
                     {
                         total += v;
@@ -986,6 +1095,8 @@ namespace CombolandsTweaks
         // The game's green placement number: the building's preview points times its multiplier.
         internal static long PreviewTotal(Building b, double factor)
         {
+            if (CustomPoints(b, out double custom))
+                return (long)Math.Round(custom * factor);
             Dictionary<Tile, long> preview = b.Behaviour?.GetScorePreview(b);
             if (preview == null)
                 return 0;
@@ -993,6 +1104,97 @@ namespace CombolandsTweaks
             foreach (long v in preview.Values)
                 sum += v;
             return (long)Math.Round(sum * b.Multiplier * factor);
+        }
+
+        // Crops are placed as their Empty form, which scores nothing itself and grows into the ripe crop.
+        private static readonly HashSet<GameTag> EmptyCrops = new HashSet<GameTag>
+        {
+            GameTag.AppleOrchardEmpty, GameTag.BerryBushEmpty, GameTag.CottonFieldEmpty, GameTag.SunflowerFarmEmpty,
+            GameTag.VineyardEmpty, GameTag.WheatFieldEmpty,
+        };
+
+        // Points per activation (per pick, for buildings that repeat activation-count times) for buildings whose real
+        // scoring isn't what GetScorePreview shows. Callers multiply by the activation count.
+        private static bool CustomPoints(Building b, out double points)
+        {
+            points = 0;
+            if (b.Behaviour == null)
+                return false;
+            double mult = b.Multiplier;
+            int picks = Math.Max(1, b.Behaviour.GetActivationCount(b));
+            switch (b.Tag)
+            {
+                case GameTag.Jeweller: // preview shows Metalworking points it never scores
+                case GameTag.Hideout:  // scores when neighbours score; see TurnValue
+                    return true;
+                case GameTag.Smelter: // no preview mode; scores its flat score param
+                    points = b.Behaviour.GetScoreParam(b) * mult;
+                    return true;
+                case GameTag.Woodcutter: // cuts activation-count Trees in range, 80 each
+                {
+                    int trees = CountInRange(b, x => x.Tag == GameTag.Trees);
+                    points = b.Behaviour.GetScoreForTag(b, GameTag.Trees) * mult * Math.Min(picks, trees) / (double)picks;
+                    return true;
+                }
+                case GameTag.Nitrary: // eats activation-count Nature/Resource buildings in range, 50 each
+                {
+                    int food = CountInRange(b, x => x.Categories.ContainsCategory(GamePieceCategory.Nature) || x.Categories.ContainsCategory(GamePieceCategory.Resource));
+                    points = b.Behaviour.GetScoreParam(b) * mult * Math.Min(picks, food) / (double)picks;
+                    return true;
+                }
+                case GameTag.PirateShip: // -100 (Fawkes Mask: +100) per land tile it can drop a chest on
+                {
+                    bool spot = false;
+                    foreach (Tile t in b.GetTilesInRange())
+                        if (t != null && t != b.Tile && !t.Type.IsSeaType() && (t.IsEmpty || (t.Building != null && t.Building.Data.CanBeBuiltOver)))
+                        {
+                            spot = true;
+                            break;
+                        }
+                    points = spot ? b.Behaviour.GetScoreParam(b) * mult : 0;
+                    return true;
+                }
+                case GameTag.BanditCamp: // -150 (Fawkes Mask: +150) for every building it triggers
+                    points = UpgradePreview.Candidates(b).Count > 0 ? b.Behaviour.GetScoreParam(b) * mult : 0;
+                    return true;
+                case GameTag.BerryPicker: // only ripe bushes are picked
+                {
+                    int ripe = CountInRange(b, x => x.Tag == GameTag.BerryBush);
+                    points = b.Behaviour.GetScoreForTag(b, GameTag.BerryBush) * mult * ripe;
+                    return true;
+                }
+                case GameTag.Stockpile: // the preview counts Plateaus, Activate doesn't
+                {
+                    Dictionary<Tile, long> preview = b.Behaviour.GetScorePreview(b);
+                    long sum = preview?.Values.Sum() ?? 0;
+                    int plateaus = CountInRange(b, x => x.Tag == GameTag.Plateau);
+                    points = (sum - b.Behaviour.GetScoreForTag(b, GameTag.Plateau) * plateaus) * mult;
+                    return true;
+                }
+            }
+            if (EmptyCrops.Contains(b.Tag))
+                return true;
+            return false;
+        }
+
+        private static int CountInRange(Building b, Func<Building, bool> match)
+        {
+            var seen = new HashSet<Building>();
+            foreach (Tile t in b.GetTilesInRange())
+                if (t != null && !t.IsEmpty && t.Building != null && t.Building != b && match(t.Building))
+                    seen.Add(t.Building);
+            return seen.Count;
+        }
+
+        // Ripe Berry Bushes regrow after the Empty bush's cooldown (4, or 1 next to an Irrigator).
+        private static double BushCycle(Building bush)
+        {
+            if (bush.Tag == GameTag.BerryBushEmpty && bush.GamePieceWithCount != null && bush.Cooldown > 0)
+                return bush.Cooldown + 0.5;
+            foreach (Tile t in bush.GetAdjacentTiles())
+                if (t != null && !t.IsEmpty && t.Building != null && t.Building.Categories.ContainsCategory(GamePieceCategory.Irrigator))
+                    return 1.5;
+            return 4.5;
         }
 
         // Puts the probe on the tile for a moment and re-runs the preview of every existing building that can see it.
@@ -1112,6 +1314,24 @@ namespace CombolandsTweaks
             return _probe;
         }
 
+        // What a card actually builds (PlacingBuilding: BuildingData.AlternatePlacedType, e.g. a crop's Empty form).
+        private static GameTag PlacedTag(GameTag card)
+        {
+            BuildingData data = ScriptableObjectSingleton<GamePieceDataHolder>.Instance.GetBuildingDataFor(card);
+            return data != null && data.AlternatePlacedType != GameTag.None ? data.AlternatePlacedType : card;
+        }
+
+        private Building GetGrown(GameTag card)
+        {
+            if (_grown != null && _grownTag == card)
+                return _grown;
+            if (_grown != null)
+                Destroy(_grown.gameObject);
+            _grown = CreateCopy(card);
+            _grownTag = _grown != null ? card : GameTag.None;
+            return _grown;
+        }
+
         // A hidden, inactive, never-built instance of a building.
         private Building CreateCopy(GameTag tag)
         {
@@ -1139,6 +1359,10 @@ namespace CombolandsTweaks
 
         private void DestroyProbe()
         {
+            if (_grown != null)
+                Destroy(_grown.gameObject);
+            _grown = null;
+            _grownTag = GameTag.None;
             if (_probe != null)
                 Destroy(_probe.gameObject);
             _probe = null;

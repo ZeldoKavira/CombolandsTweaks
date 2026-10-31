@@ -793,6 +793,8 @@ namespace CombolandsTweaks
             }
         }
 
+        private static readonly HashSet<GameTag> SkipsOwnKind = new HashSet<GameTag> { GameTag.Trawler, GameTag.Treasury, GameTag.FishTrap, GameTag.HerbGarden };
+
         internal static List<Building> Candidates(Building t)
         {
             Triggerer cfg = Triggerers[t.Tag];
@@ -819,7 +821,10 @@ namespace CombolandsTweaks
                 if (tile == null || tile.IsEmpty)
                     continue;
                 Building x = tile.Building;
-                if (x == null || x == t || x.Tag == t.Tag || !x.Behaviour.CanBeActivated(x))
+                // The trigger queue drops triggers a building doesn't list; only a few triggerers skip their own kind.
+                if (x == null || x == t || !x.Behaviour.CanBeActivated(x) || x.Behaviour.ValidTriggers == null || !x.Behaviour.ValidTriggers.Contains(TriggerType.OnActivate))
+                    continue;
+                if (x.Tag == t.Tag && SkipsOwnKind.Contains(t.Tag))
                     continue;
                 if (cats != null && cats.Length > 0 && !x.Categories.ContainsAnyOf(cats))
                     continue;
