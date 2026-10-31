@@ -33,8 +33,16 @@ namespace CombolandsTweaks
             public double Now;
             public double After;
             public bool PerTurn;
-            public int Affected; // paints: other buildings whose points change
+            public int Affected; // paints/removal: other buildings whose points change
+            public double Once;  // removal: one-off points from buildings that react to it
+            public string Note;  // removal: what else happens
         }
+
+        // Hammer (or a removal spell) in hand: preview removing each building.
+        private bool _shownRemove;
+        private bool _jobRemove;
+        private Building _treeTemplate;
+        private readonly List<Building> _treePool = new List<Building>();
 
         private Dictionary<Building, Row> _rows = new Dictionary<Building, Row>();
         private double _bestGain;
@@ -104,7 +112,8 @@ namespace CombolandsTweaks
                 if (tag == GameTag.None && SerializedMonoSingleton<CouncilFavour>.HasInstance)
                     vote = FindVote(out current);
             }
-            int key = tag != GameTag.None ? (int)tag : vote != CouncilCharacter.None ? -(1000 + (int)vote * 2 + (current ? 1 : 0)) : 0;
+            bool remove = tag == GameTag.None && vote == CouncilCharacter.None && Plugin.UpgradePreviewEnabled.Value && IsRemoving();
+            int key = tag != GameTag.None ? (int)tag : vote != CouncilCharacter.None ? -(1000 + (int)vote * 2 + (current ? 1 : 0)) : remove ? -9000 : 0;
             if (key == 0)
             {
                 _rows.Clear();
@@ -112,6 +121,7 @@ namespace CombolandsTweaks
                 _shownKey = 0;
                 _shownTag = GameTag.None;
                 _shownVote = CouncilCharacter.None;
+                _shownRemove = false;
                 Showing = false;
                 return;
             }
@@ -125,9 +135,10 @@ namespace CombolandsTweaks
             }
             if (key != _shownKey || board != _shownBoard)
             {
-                StartJob(tag);
+                StartJob(tag, remove);
                 _jobVote = vote;
                 _jobVoteCurrent = current;
+                _shownRemove = remove;
                 _shownKey = key;
                 _shownTag = tag;
                 _shownVote = vote;
@@ -142,6 +153,14 @@ namespace CombolandsTweaks
                     StepJob();
             }
             Showing = _rows.Count > 0;
+        }
+
+        private static bool IsRemoving()
+        {
+            if (!SerializedMonoSingleton<InteractionController>.HasInstance)
+                return false;
+            InteractionState state = SerializedMonoSingleton<InteractionController>.Instance.CurrentInteractionState;
+            return state is RemovingBuilding || state is RemoveBuildingGainGoldMult || state is RemoveBuildingGainVote;
         }
 
         // A council vote under the mouse: one you could get (consumables bar, shop, pack pick) or a member in the
@@ -318,8 +337,9 @@ namespace CombolandsTweaks
             return RectTransformUtility.RectangleContainsScreenPoint(rt, Input.mousePosition, cam);
         }
 
-        private void StartJob(GameTag tag)
+        private void StartJob(GameTag tag, bool remove = false)
         {
+            _jobRemove = remove;
             _jobActive = false;
             _jobBuildings.Clear();
             _jobRows = new Dictionary<Building, Row>();
@@ -337,7 +357,7 @@ namespace CombolandsTweaks
                     if (b == null || b.Values == null || !b.isActiveAndEnabled)
                         continue;
                     _jobBuildings.Add(b);
-                    if (IsPaint(tag))
+                    if (IsPaint(tag) || remove)
                     {
                         if (b.Tag == GameTag.TownHall)
                             _townHalls.Add(b);
@@ -349,6 +369,13 @@ namespace CombolandsTweaks
             catch (Exception e)
             {
                 LogOnce($"Upgrade preview setup for {tag} failed: {e}");
+                return;
+            }
+            if (remove)
+            {
+                _jobTag = GameTag.None;
+                _jobAmount = 0f;
+                _jobActive = true;
                 return;
             }
             _jobTag = tag;
@@ -380,12 +407,12 @@ namespace CombolandsTweaks
                 try
                 {
                     Row row;
-                    bool ok = IsPaint(_jobTag) ? PaintRow(b, _jobTag, out row) : StatRow(b, _jobTag, _jobAmount, out row);
+                    bool ok = _jobRemove ? RemoveRow(b, out row) : IsPaint(_jobTag) ? PaintRow(b, _jobTag, out row) : StatRow(b, _jobTag, _jobAmount, out row);
                     if (!ok)
                         continue;
                     _jobRows[b] = row;
-                    if (row.After - row.Now > _jobBest)
-                        _jobBest = row.After - row.Now;
+                    if (Score(row) > _jobBest)
+                        _jobBest = Score(row);
                 }
                 catch (Exception e)
                 {
@@ -405,6 +432,189 @@ namespace CombolandsTweaks
                 return;
             _loggedError = true;
             Plugin.Log.LogError(message);
+        }
+
+        // Rows are ranked by their per-turn change plus one-off points spread over the weeks left in the milestone.
+        private static double Score(Row r) => r.After - r.Now + r.Once / PlacementScores.Horizon();
+
+        // Buildings that activate when a building is removed (BuildingRemovalOccurred): where they look
+        // (0 = anywhere, 1 = range, 2 = adjacent) and which of their target categories the removed building must be in.
+        private static readonly (GameTag tag, int area, int category)[] RemovalReactors =
+        {
+            (GameTag.Composter, 1, 0),
+            (GameTag.Fortress, 1, 0),
+            (GameTag.GuardTower, 1, 0),
+            (GameTag.Graveyard, 0, 0),
+            (GameTag.JoustingArena, 2, 0),
+            (GameTag.Workshop, 1, 1),
+            (GameTag.Apothecary, 1, 1),
+        };
+
+        // Removing a building: its own points go, neighbours lose (or gain) from the empty tile, its removal ability
+        // fires (Banner: +mult to adjacent; Watch Tower: Trees on adjacent empty grass) and reacting buildings activate.
+        private bool RemoveRow(Building b, out Row row)
+        {
+            row = default;
+            if (b.Tile == null || !b.Behaviour.CanRemove(b))
+                return false;
+            Tile tile = b.Tile;
+            var affected = new List<Building> { b };
+            void AddSeeing(Tile t)
+            {
+                if (t != null && _watchers.TryGetValue(t, out List<Building> seeing))
+                    foreach (Building w in seeing)
+                        if (!affected.Contains(w))
+                            affected.Add(w);
+            }
+            AddSeeing(tile);
+            foreach (Building w in _townHalls)
+                if (!affected.Contains(w))
+                    affected.Add(w);
+
+            // Watch Tower plants Trees on its adjacent empty grass (sand too with Fertilizer) and Plateaus.
+            var treeTiles = new List<Tile>();
+            if (b.Tag == GameTag.WatchTower)
+            {
+                bool sand = MonoSingleton<ItemHeirloomController>.HasInstance && MonoSingleton<ItemHeirloomController>.Instance.IsItemWithTagEquipped(GameTag.Fertilizer);
+                foreach (Tile t in b.GetAdjacentTiles())
+                {
+                    if (t == null)
+                        continue;
+                    bool empty = t.IsEmpty && (t.Type == TileType.Grass || (sand && t.Type == TileType.Sand));
+                    bool plateau = !t.IsEmpty && t.Building != null && t.Building.Tag == GameTag.Plateau;
+                    if (empty || plateau)
+                    {
+                        treeTiles.Add(t);
+                        AddSeeing(t);
+                    }
+                }
+            }
+            List<Building> bannerTargets = b.Tag == GameTag.Banner ? PlacementScores.GrantTargets(b) : new List<Building>();
+            float bannerMult = b.Tag == GameTag.Banner ? b.Behaviour.GetMultParam(b) : 0f;
+
+            row.PerTurn = true;
+            row.Affected = affected.Count - 1;
+            foreach (Building x in affected)
+                row.Now += PlacementScores.TurnValue(x);
+
+            var trees = new List<Building>();
+            var treePrevious = new List<Building>();
+            tile.RemoveCurrentBuilding();
+            try
+            {
+                foreach (Building x in bannerTargets)
+                    PlacementScores.LocalMult(x.Values) += bannerMult;
+                for (int i = 0; i < treeTiles.Count; i++)
+                {
+                    Building tree = TreeCopy(i);
+                    if (tree == null)
+                        break;
+                    tree.transform.position = new Vector3(treeTiles[i].X, treeTiles[i].Y);
+                    treePrevious.Add(treeTiles[i].Building);
+                    treeTiles[i].AssignBuilding(tree);
+                    trees.Add(tree);
+                }
+                BuildingExtensions.ResetCaches();
+
+                foreach (Building x in affected)
+                    if (x != b)
+                        row.After += PlacementScores.TurnValue(x);
+                foreach (Building tree in trees)
+                    row.After += PlacementScores.TurnValue(tree);
+
+                // Buildings that react to the removal.
+                foreach (Building r in MonoSingleton<BuildingController>.Instance.Buildings)
+                {
+                    if (r == null || r == b || r.Behaviour == null)
+                        continue;
+                    foreach ((GameTag rtag, int area, int category) in RemovalReactors)
+                    {
+                        if (r.Tag != rtag)
+                            continue;
+                        if (area == 1 && !r.GetTilesInRange().Contains(tile))
+                            break;
+                        if (area == 2 && !r.GetAdjacentTiles().Contains(tile))
+                            break;
+                        if (category > 0 && !b.Categories.ContainsCategory(r.Behaviour.GetTargetCategoryByNumber(r, category)))
+                            break;
+                        if (PlacementScores.IsGranter(r))
+                        {
+                            double perTurn = PlacementScores.GrantPerTurn(r);
+                            row.After += perTurn;
+                            row.Note = Join(row.Note, $"{NameOf(r)} reacts: +{Format(perTurn)}/turn for good");
+                        }
+                        else
+                        {
+                            double v = PlacementScores.ActivationValue(r, 1, grants: false);
+                            if (v >= 0.5)
+                            {
+                                row.Once += v;
+                                row.Note = Join(row.Note, $"{NameOf(r)} reacts: +{Format(v)} now");
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            finally
+            {
+                for (int i = trees.Count - 1; i >= 0; i--)
+                {
+                    if (treePrevious[i] != null)
+                        treeTiles[i].AssignBuilding(treePrevious[i]);
+                    else
+                        treeTiles[i].RemoveCurrentBuilding();
+                }
+                foreach (Building x in bannerTargets)
+                    PlacementScores.LocalMult(x.Values) -= bannerMult;
+                tile.AssignBuilding(b);
+                BuildingExtensions.ResetCaches();
+            }
+
+            if (b.Tag == GameTag.Banner && bannerTargets.Count > 0)
+                row.Note = Join(row.Note, $"+{bannerMult:0.##} mult to {bannerTargets.Count} adjacent building{(bannerTargets.Count == 1 ? "" : "s")}");
+            if (trees.Count > 0)
+                row.Note = Join(row.Note, $"plants {trees.Count} Trees");
+            if (b.Tag == GameTag.Manure || b.Tag == GameTag.GoldOre)
+                row.Note = Join(row.Note, "gives money");
+            return Math.Abs(row.After - row.Now) >= 0.05 || row.Once >= 0.5 || row.Note != null;
+        }
+
+        private static string Join(string a, string b) => string.IsNullOrEmpty(a) ? b : a + "; " + b;
+
+        // Hidden Trees for Watch Tower previews, reused across rows.
+        private Building TreeCopy(int index)
+        {
+            while (_treePool.Count <= index)
+            {
+                var data = Framework.ScriptableObjectSingleton<GamePieceDataHolder>.Instance.GetBuildingDataFor(GameTag.Trees);
+                if (data == null || data.BuildingPrefab == null || !SerializedMonoSingleton<MapController>.HasInstance)
+                    return null;
+                MapController map = SerializedMonoSingleton<MapController>.Instance;
+                Building tree = Instantiate(data.BuildingPrefab, new Vector3(map.Width / 2, map.Height / 2), Quaternion.identity);
+                tree.name = "CombolandsTweaks preview tree";
+                try
+                {
+                    tree.Init(GameTag.Trees, playerInitiated: false);
+                }
+                catch (Exception e)
+                {
+                    Destroy(tree.gameObject);
+                    LogOnce($"Couldn't create a preview tree: {e}");
+                    return null;
+                }
+                tree.gameObject.SetActive(false);
+                _treePool.Add(tree);
+            }
+            return _treePool[index];
+        }
+
+        private void OnDestroy()
+        {
+            foreach (Building t in _treePool)
+                if (t != null)
+                    Destroy(t.gameObject);
+            _treePool.Clear();
         }
 
         // Points per turn before any change, memoised for the job.
@@ -735,8 +945,9 @@ namespace CombolandsTweaks
                 GUI.color = old;
 
                 double gain = r.After - r.Now;
-                _bigStyle.normal.textColor = ColourFor(gain);
-                DrawFitted(new Rect(box.x, box.y, box.width, bigH), $"{(gain > 0 ? "+" : "")}{Format(gain)}", _bigStyle, bigH);
+                bool onceOnly = Math.Abs(gain) < 0.05 && r.Once >= 0.5;
+                _bigStyle.normal.textColor = onceOnly ? new Color(0.45f, 0.9f, 1f) : ColourFor(gain);
+                DrawFitted(new Rect(box.x, box.y, box.width, bigH), onceOnly ? $"+{Format(r.Once)}" : $"{(gain > 0 ? "+" : "")}{Format(gain)}", _bigStyle, bigH);
                 DrawFitted(new Rect(box.x, box.y + bigH, box.width, smallH), $"{Format(r.Now)}→{Format(r.After)}{(r.PerTurn ? "" : "/act")}", _smallStyle, smallH);
             }
 
@@ -760,10 +971,13 @@ namespace CombolandsTweaks
         private void DrawTopList(float scale)
         {
             var top = new List<KeyValuePair<Building, Row>>(_rows);
-            top.RemoveAll(e => e.Key == null || !e.Value.PerTurn || e.Value.After - e.Value.Now <= 0);
+            if (_shownRemove)
+                top.RemoveAll(e => e.Key == null);
+            else
+                top.RemoveAll(e => e.Key == null || !e.Value.PerTurn || e.Value.After - e.Value.Now <= 0);
             if (top.Count == 0)
                 return;
-            top.Sort((a, b) => (b.Value.After - b.Value.Now).CompareTo(a.Value.After - a.Value.Now));
+            top.Sort((a, b) => Score(b.Value).CompareTo(Score(a.Value)));
             double total = 0;
             foreach (KeyValuePair<Building, Row> e in _rows)
                 if (e.Key != null && e.Value.PerTurn)
@@ -776,6 +990,10 @@ namespace CombolandsTweaks
                     ? $"{NameOf(_shownVote)}'s {cur} vote{(cur == 1 ? "" : "s")} add {Format(total)} points per turn"
                     : $"A vote for {NameOf(_shownVote)} ({cur} \u2192 {cur + 1}): {(total >= 0 ? "+" : "")}{Format(total)} points per turn";
             }
+            else if (_shownRemove)
+            {
+                title = "Best buildings to remove (change in points per turn)";
+            }
             else
             {
                 title = $"Best buildings for this upgrade (points per turn)";
@@ -785,7 +1003,8 @@ namespace CombolandsTweaks
             {
                 Row r = top[i].Value;
                 double gain = r.After - r.Now;
-                sb.Append($"\n{i + 1}. {NameOf(top[i].Key)}  <color={Hex(ColourFor(gain))}>+{Format(gain)}</color>  ({Format(r.Now)} → {Format(r.After)})");
+                sb.Append($"\n{i + 1}. {NameOf(top[i].Key)}  <color={Hex(ColourFor(gain))}>{(gain >= 0 ? "+" : "")}{Format(gain)}</color>"
+                          + (r.Once >= 0.5 ? $" +{Format(r.Once)} now" : "") + $"  ({Format(r.Now)} → {Format(r.After)})");
             }
             _panelStyle.fontSize = Mathf.Clamp(Mathf.RoundToInt(15 * scale), 10, 30);
             _content.text = sb.ToString();
@@ -803,7 +1022,10 @@ namespace CombolandsTweaks
         {
             double gain = r.After - r.Now;
             string how;
-            if (_shownVote != CouncilCharacter.None)
+            if (_shownRemove)
+                how = $"points per turn of it and the {r.Affected} building{(r.Affected == 1 ? "" : "s")} around it, before \u2192 after removing it"
+                      + (r.Once >= 0.5 ? $"\n+{Format(r.Once)} points straight away" : "") + (r.Note != null ? "\n" + r.Note : "");
+            else if (_shownVote != CouncilCharacter.None)
                 how = _shownVoteCurrent ? $"points per turn without {NameOf(_shownVote)}'s votes \u2192 now" : $"points per turn now \u2192 with one more vote for {NameOf(_shownVote)}";
             else if (IsPaint(_shownTag))
                 how = $"points per turn of it and the {r.Affected} building{(r.Affected == 1 ? "" : "s")} around it that it counts for";
