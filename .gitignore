@@ -1,0 +1,9 @@
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.zip
+
+# Game code - regenerate with ./decompile.sh, never commit
+decompiled/
