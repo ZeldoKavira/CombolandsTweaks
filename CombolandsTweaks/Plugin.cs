@@ -12,7 +12,7 @@ namespace CombolandsTweaks
     {
         public const string Guid = "zeldo.combolands.tweaks";
         public const string Name = "Combolands Tweaks";
-        public const string Version = "0.4.0";
+        public const string Version = "0.5.0";
 
         internal static ManualLogSource Log;
 
@@ -29,6 +29,8 @@ namespace CombolandsTweaks
 
         internal static ConfigEntry<bool> BuildingScoresEnabled;
         internal static ConfigEntry<KeyboardShortcut> BuildingScoresKey;
+
+        internal static ConfigEntry<bool> UpgradePreviewEnabled;
 
         internal static ConfigEntry<float> SpeedBoost;
 
@@ -66,6 +68,9 @@ namespace CombolandsTweaks
             BuildingScoresKey = Config.Bind("Building scores", "ToggleKey", new KeyboardShortcut(KeyCode.F11),
                 "Turns the building score labels on or off.");
 
+            UpgradePreviewEnabled = Config.Bind("Building upgrades", "Preview", true,
+                "While a building upgrade is hovered or picked, show points per turn now and with it on every building it can go on.");
+
             SpeedBoost = Config.Bind("Game speed", "SpeedBoost", 1f,
                 new ConfigDescription("Extra speed on top of the game's own Game Speed setting.", new AcceptableValueRange<float>(1f, 5f)));
 
@@ -80,6 +85,7 @@ namespace CombolandsTweaks
             _host.hideFlags = HideFlags.HideAndDontSave;
             _host.AddComponent<PlacementScores>();
             _host.AddComponent<BuildingScores>();
+            _host.AddComponent<UpgradePreview>();
             _host.AddComponent<GameSpeed>();
             _host.AddComponent<PoolWindow>();
             _host.AddComponent<SettingsWindow>();

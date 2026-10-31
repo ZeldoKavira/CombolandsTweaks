@@ -56,6 +56,9 @@ namespace CombolandsTweaks
             Plugin.BuildingScoresEnabled.Value = GUILayout.Toggle(Plugin.BuildingScoresEnabled.Value,
                 $" Show each building's points per activation ({Plugin.BuildingScoresKey.Value})");
 
+            Plugin.UpgradePreviewEnabled.Value = GUILayout.Toggle(Plugin.UpgradePreviewEnabled.Value,
+                " Building upgrades: show points per turn now / with it");
+
             GUILayout.BeginHorizontal();
             GUILayout.Label($"Text size {Plugin.ScoreTextScale.Value:0.0}x", GUILayout.Width(110f));
             Plugin.ScoreTextScale.Value = Mathf.Round(GUILayout.HorizontalSlider(Plugin.ScoreTextScale.Value, 0.5f, 2f) * 10f) / 10f;

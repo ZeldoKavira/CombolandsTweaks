@@ -55,7 +55,7 @@ namespace CombolandsTweaks
         private void OnGUI()
         {
             // While placing, the game draws its own preview numbers on these buildings.
-            if (_scores.Count == 0 || PlacementScores.ShowingPlacement || Event.current.type != EventType.Repaint)
+            if (_scores.Count == 0 || PlacementScores.ShowingPlacement || UpgradePreview.Showing || Event.current.type != EventType.Repaint)
                 return;
             Camera cam = Camera.main;
             if (cam == null)

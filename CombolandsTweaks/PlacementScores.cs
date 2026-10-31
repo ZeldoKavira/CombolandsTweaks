@@ -451,7 +451,7 @@ namespace CombolandsTweaks
 
         // The game's range/adjacency caches are keyed by building. Dropping just the entries of the buildings whose
         // surroundings changed keeps everyone else's cached results valid.
-        private static void ForgetCaches(Building building)
+        internal static void ForgetCaches(Building building)
         {
             AdjacencyCache()?.Remove(building);
             RangeCache()?.Remove(building);
