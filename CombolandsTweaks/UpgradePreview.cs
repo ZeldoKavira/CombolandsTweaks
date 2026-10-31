@@ -6,6 +6,7 @@ using HarmonyLib;
 using Interaction;
 using Interaction.InteractionStates;
 using Library;
+using Library.Grid;
 using UI;
 using UI.Shop;
 using GameState.Data;
@@ -183,14 +184,16 @@ namespace CombolandsTweaks
 
         // How buildings trigger each other, modelled on the behaviours that call TriggerController.AddOnActivatedTrigger:
         // most pick (activation count) random buildings from their adjacent tiles or range each time they activate;
-        // a few trigger every match. Ballista, Outpost, Post Office, Sparring Yard and Herb Garden aren't modelled.
-        internal enum Area { Adjacent, Range }
+        // some trigger every match; Ballista shoots in one of 4 random directions per shot; Post Office triggers the
+        // building above it; Outpost picks one adjacent building whose only neighbour is the Outpost.
+        internal enum Area { Adjacent, Range, Up, Orthogonal }
 
         internal struct Triggerer
         {
             public Area Area;
-            public bool All;          // triggers every candidate instead of picking at random
+            public bool All;           // triggers every candidate instead of picking at random
             public bool UseCategories; // only buildings in its target categories
+            public bool Isolated;      // only buildings whose sole neighbour is the triggerer (Outpost)
         }
 
         internal static readonly Dictionary<GameTag, Triggerer> Triggerers = new Dictionary<GameTag, Triggerer>
@@ -205,9 +208,14 @@ namespace CombolandsTweaks
             { GameTag.Treasury, new Triggerer { Area = Area.Adjacent } },
             { GameTag.Harvester, new Triggerer { Area = Area.Adjacent } },
             { GameTag.GuardTower, new Triggerer { Area = Area.Adjacent } },
+            { GameTag.Outpost, new Triggerer { Area = Area.Adjacent, Isolated = true } },
             { GameTag.EffigyPyre, new Triggerer { Area = Area.Adjacent, All = true } },
             { GameTag.Marketplace, new Triggerer { Area = Area.Adjacent, All = true, UseCategories = true } },
+            { GameTag.HerbGarden, new Triggerer { Area = Area.Adjacent, All = true, UseCategories = true } },
             { GameTag.FishTrap, new Triggerer { Area = Area.Range, All = true, UseCategories = true } },
+            { GameTag.SparringYard, new Triggerer { Area = Area.Range, All = true, UseCategories = true } },
+            { GameTag.PostOffice, new Triggerer { Area = Area.Up, All = true } },
+            { GameTag.Ballista, new Triggerer { Area = Area.Orthogonal } },
         };
 
         // Per building, before any upgrade: points per activation, and activations per turn it gets from others.
@@ -251,7 +259,22 @@ namespace CombolandsTweaks
         internal static List<Building> Candidates(Building t)
         {
             Triggerer cfg = Triggerers[t.Tag];
-            HashSet<Tile> tiles = cfg.Area == Area.Range ? t.GetTilesInRange() : t.GetAdjacentTiles();
+            IEnumerable<Tile> tiles;
+            switch (cfg.Area)
+            {
+                case Area.Range:
+                    tiles = t.GetTilesInRange();
+                    break;
+                case Area.Up:
+                    tiles = new[] { t.Tile?.UpNeighbour() };
+                    break;
+                case Area.Orthogonal:
+                    tiles = t.Tile == null ? new Tile[0] : new[] { t.Tile.UpNeighbour(), t.Tile.LeftNeighbour(), t.Tile.DownNeighbour(), t.Tile.RightNeighbour() };
+                    break;
+                default:
+                    tiles = t.GetAdjacentTiles();
+                    break;
+            }
             GamePieceCategory[] cats = cfg.UseCategories ? t.Behaviour.GetTargetCategories(t) : null;
             var list = new List<Building>();
             foreach (Tile tile in tiles)
@@ -263,19 +286,41 @@ namespace CombolandsTweaks
                     continue;
                 if (cats != null && cats.Length > 0 && !x.Categories.ContainsAnyOf(cats))
                     continue;
+                if (cfg.Isolated && !OnlyNeighbourIs(x, t))
+                    continue;
                 if (!list.Contains(x))
                     list.Add(x);
             }
             return list;
         }
 
+        private static bool OnlyNeighbourIs(Building x, Building t)
+        {
+            foreach (Tile n in x.GetAdjacentTiles())
+                if (n != null && !n.IsEmpty && n.Building != t && n.Building != x)
+                    return false;
+            return true;
+        }
+
+        // Expected activations each candidate gets per activation of the triggerer, including its activation chance
+        // (Brewery fires half the time).
         internal static double Share(Building t, List<Building> targets)
         {
             if (targets.Count == 0)
                 return 0;
-            if (Triggerers[t.Tag].All)
-                return 1;
-            return Math.Min(1.0, Math.Max(1, t.Behaviour.GetActivationCount(t)) / (double)targets.Count);
+            double chance = Math.Min(1.0, t.Behaviour.GetActivationChance(t));
+            if (chance <= 0)
+                chance = 1.0;
+            Triggerer cfg = Triggerers[t.Tag];
+            if (cfg.All)
+                return chance;
+            if (t.Tag == GameTag.Ballista)
+            {
+                // One shot plus one per Arbalest, each in one of 4 directions.
+                int shots = 1 + (MonoSingleton<ItemHeirloomController>.HasInstance ? MonoSingleton<ItemHeirloomController>.Instance.GetCountOfItemWithTagEquipped(GameTag.Arbalest) : 0);
+                return chance * shots / 4.0;
+            }
+            return chance * Math.Min(1.0, Math.Max(1, t.Behaviour.GetActivationCount(t)) / (double)targets.Count);
         }
 
         private static bool HasCountdown(Building b) => b.GamePieceWithCount != null && b.Cooldown > 0;
