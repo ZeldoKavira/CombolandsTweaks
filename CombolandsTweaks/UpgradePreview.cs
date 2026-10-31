@@ -652,7 +652,7 @@ namespace CombolandsTweaks
 
         private static bool HasCountdown(Building b) => b.GamePieceWithCount != null && b.Cooldown > 0;
 
-        private static double OwnRate(Building b) => HasCountdown(b) ? 1.0 / b.Cooldown : 0;
+        private static double OwnRate(Building b) => PlacementScores.OwnRate(b);
 
         // Points per activation (the game's preview) times activations.
         private static double PointsPerActivation(Building b) =>
@@ -812,7 +812,7 @@ namespace CombolandsTweaks
             else
             {
                 _incoming.TryGetValue(b, out double incoming);
-                how = "points per turn (" + (HasCountdown(b) ? $"every {b.Cooldown} turns" : "no countdown")
+                how = "points per turn (" + (PlacementScores.IsIrrigated(b) ? "irrigated: every turn" : HasCountdown(b) ? $"every {b.Cooldown} turns" : "no countdown")
                       + (incoming > 0 ? $", +{incoming:0.##} triggers/turn from neighbours" : "")
                       + (Triggerers.ContainsKey(b.Tag) && HasCountdown(b) ? ", incl. what it triggers" : "") + ")";
             }

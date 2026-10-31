@@ -554,8 +554,27 @@ namespace CombolandsTweaks
         private static string NameOf(GameTag tag) =>
             ScriptableObjectSingleton<StringLookup>.Instance.GetNameForTag(tag, out string name) ? name : tag.ToString();
 
-        // Activations per turn from the building's own countdown (Lamppost-style cooldown cuts show up here).
-        internal static double OwnRate(Building b) => b.GamePieceWithCount != null && b.Cooldown > 0 ? 1.0 / b.Cooldown : 0;
+        // Activations per turn from the building's own countdown (Lamppost-style cooldown cuts show up here). Irrigation
+        // and Reservoir zero the countdown of adjacent crops (not Sunflower Farm) every end of turn, so those activate
+        // every turn whatever their cooldown.
+        internal static double OwnRate(Building b)
+        {
+            if (b.GamePieceWithCount == null || b.Cooldown <= 0)
+                return 0;
+            if (IsIrrigated(b))
+                return 1.0;
+            return 1.0 / b.Cooldown;
+        }
+
+        internal static bool IsIrrigated(Building b)
+        {
+            if (b.Tag == GameTag.SunflowerFarm || !b.Categories.ContainsCategory(GamePieceCategory.Crop))
+                return false;
+            foreach (Tile t in b.GetAdjacentTiles())
+                if (t != null && !t.IsEmpty && t.Building != null && (t.Building.Tag == GameTag.Irrigation || t.Building.Tag == GameTag.Reservoir))
+                    return true;
+            return false;
+        }
 
         // Average points per turn: one activation's worth (own points and what it triggers) times activations per turn.
         internal static double TurnValue(Building b, double factor = 1.0) =>
