@@ -11,6 +11,7 @@ using HarmonyLib;
 using Interaction;
 using Interaction.InteractionStates;
 using Library;
+using Library.Grid;
 using UI;
 using UnityEngine;
 
@@ -420,6 +421,20 @@ namespace CombolandsTweaks
 
                 // A building that triggers others (Marketplace -> Stalls, Sawmill, ...) earns their points when it
                 // activates; the game's preview only shows what it scores itself.
+                if (IsGranter(probe))
+                {
+                    int targets = GrantTargets(probe).Count;
+                    double perTurn = GrantPerTurn(probe);
+                    string how = "";
+                    if (probe.Tag == GameTag.Composter)
+                    {
+                        int manure = probe.GetAdjacentTiles().Count(t => t != null && !t.IsEmpty && t.Building != null && t.Building.Tag == GameTag.Manure);
+                        double fromSheep = OwnRate(probe) - manure / Horizon();
+                        how = (manure > 0 ? $", clears {manure} Manure next turn (+{Fmt(manure * perTurn)}/turn)" : "")
+                              + (fromSheep > 0.005 ? $", ~{fromSheep:0.##} more activations/turn from Sheep Farm Manure" : "");
+                    }
+                    score.Note = Join(score.Note, $"each activation: +{probe.Behaviour.GetMultParam(probe):0.##} mult to {targets} building{(targets == 1 ? "" : "s")} (+{Fmt(perTurn)}/turn, {Horizon():0} weeks left){how}");
+                }
                 long triggered = TriggeredPoints(probe, out int count);
                 if (triggered != 0)
                 {
@@ -509,7 +524,7 @@ namespace CombolandsTweaks
 
         // Points a triggering building hands out per activation: each target's activation value times the chance it
         // gets picked. A target that triggers others passes its own deliveries on, down to `depth` more steps.
-        internal static double Delivered(Building t, int depth)
+        internal static double Delivered(Building t, int depth, bool grants = true)
         {
             if (!UpgradePreview.Triggerers.ContainsKey(t.Tag))
                 return 0;
@@ -517,17 +532,138 @@ namespace CombolandsTweaks
             double share = UpgradePreview.Share(t, targets);
             double points = 0;
             foreach (Building x in targets)
-                points += share * ActivationValue(x, depth);
+                points += share * ActivationValue(x, depth, grants);
             return points;
         }
 
-        // Points one activation of a building is worth: its own preview times activations, plus what it triggers.
-        internal static double ActivationValue(Building x, int depth)
+        // Points one activation of a building is worth: its own preview times activations, plus what it triggers, plus
+        // (for buildings that hand out permanent mult) what that mult earns by the end of the milestone.
+        internal static double ActivationValue(Building x, int depth, bool grants = true)
         {
             double value = PreviewTotal(x, 1.0) * Math.Max(1, x.Behaviour.GetActivationCount(x));
             if (depth > 0)
-                value += Delivered(x, depth - 1);
+                value += Delivered(x, depth - 1, grants);
+            if (grants)
+                value += GrantValue(x);
             return value;
+        }
+
+        // Buildings that permanently add mult to others each time they activate: Composter (+0.1 to Farms in range),
+        // Field Hospital (+0.2 to Healing/Training in range), Cotton Field (+0.2 to every adjacent building).
+        private static readonly Dictionary<GameTag, (UpgradePreview.Area area, bool useCategories)> Granters =
+            new Dictionary<GameTag, (UpgradePreview.Area, bool)>
+            {
+                { GameTag.Composter, (UpgradePreview.Area.Range, true) },
+                { GameTag.FieldHospital, (UpgradePreview.Area.Range, true) },
+                { GameTag.CottonField, (UpgradePreview.Area.Adjacent, false) },
+            };
+
+        internal static bool IsGranter(Building b) => Granters.ContainsKey(b.Tag);
+
+        // Weeks left in the current milestone: how long a permanent mult grant made now gets to pay out here.
+        internal static double Horizon() =>
+            MonoSingleton<GameController>.HasInstance ? Math.Max(1, MonoSingleton<GameController>.Instance.WeeksRemaining) : 1;
+
+        internal static List<Building> GrantTargets(Building g)
+        {
+            var list = new List<Building>();
+            if (!Granters.TryGetValue(g.Tag, out var cfg))
+                return list;
+            HashSet<Tile> tiles = cfg.area == UpgradePreview.Area.Range ? g.GetTilesInRange() : g.GetAdjacentTiles();
+            GamePieceCategory[] cats = cfg.useCategories ? g.Behaviour.GetTargetCategories(g) : null;
+            foreach (Tile t in tiles)
+            {
+                if (t == null || t.IsEmpty || t.Building == null || t.Building == g || t.Building.Values == null || !t.Building.Tag.CanGetMult())
+                    continue;
+                if (cats != null && cats.Length > 0 && !t.Building.Categories.ContainsAnyOf(cats))
+                    continue;
+                if (!list.Contains(t.Building))
+                    list.Add(t.Building);
+            }
+            return list;
+        }
+
+        // Extra points per turn one activation's mult grant adds to its targets, for good.
+        internal static double GrantPerTurn(Building g)
+        {
+            if (!Granters.ContainsKey(g.Tag))
+                return 0;
+            float mult = g.Behaviour.GetMultParam(g);
+            double gain = 0;
+            foreach (Building x in GrantTargets(g))
+            {
+                double before = TurnValue(x, 1.0, grants: false);
+                LocalMult(x.Values) += mult;
+                ForgetCaches(x);
+                try
+                {
+                    gain += TurnValue(x, 1.0, grants: false) - before;
+                }
+                finally
+                {
+                    LocalMult(x.Values) -= mult;
+                    ForgetCaches(x);
+                }
+            }
+            return gain;
+        }
+
+        internal static double GrantValue(Building g) => Granters.ContainsKey(g.Tag) ? GrantPerTurn(g) * Horizon() : 0;
+
+        // Composter activations per turn: Manure that lands next to it is cleared (and so activates it) at end of turn.
+        // Sheep Farms drop Manure on a random empty grass tile next to them each time they activate; Manure already
+        // adjacent counts once, spread over the milestone.
+        internal static double ManureRate(Building composter)
+        {
+            HashSet<Tile> adjacent = composter.GetAdjacentTiles();
+            double rate = 0;
+            int manure = 0;
+            var sheep = new HashSet<Building>();
+            foreach (Tile a in adjacent)
+            {
+                if (a == null)
+                    continue;
+                if (!a.IsEmpty && a.Building != null && a.Building.Tag == GameTag.Manure)
+                    manure++;
+                foreach (Tile n in a.Get8NeighboursEnumerable())
+                    if (n != null && !n.IsEmpty && n.Building != null && n.Building.Tag == GameTag.SheepFarm)
+                        sheep.Add(n.Building);
+            }
+            foreach (Building s in sheep)
+            {
+                int spots = 0, near = 0;
+                foreach (Tile t in s.GetAdjacentTiles())
+                {
+                    if (t == null || t.Type != TileType.Grass || !(t.IsEmpty || (t.Building != null && t.Building.Tag == GameTag.Plateau)))
+                        continue;
+                    spots++;
+                    if (adjacent.Contains(t))
+                        near++;
+                }
+                if (spots > 0 && near > 0)
+                    rate += TriggerRate(s) * near / spots;
+            }
+            return rate + manure / Horizon();
+        }
+
+        // Activations per turn a building gets from neighbours with a countdown that trigger it.
+        internal static double TriggerRate(Building x)
+        {
+            if (!MonoSingleton<BuildingController>.HasInstance)
+                return 0;
+            double rate = 0;
+            foreach (Building t in MonoSingleton<BuildingController>.Instance.Buildings)
+            {
+                if (t == null || t == x || !UpgradePreview.Triggerers.ContainsKey(t.Tag))
+                    continue;
+                double own = t.GamePieceWithCount != null && t.Cooldown > 0 ? 1.0 / t.Cooldown : 0;
+                if (own <= 0)
+                    continue;
+                List<Building> targets = UpgradePreview.Candidates(t);
+                if (targets.Contains(x))
+                    rate += own * UpgradePreview.Share(t, targets);
+            }
+            return rate;
         }
 
         // What extra mult adds to an existing building's preview points.
@@ -559,6 +695,8 @@ namespace CombolandsTweaks
         // every turn whatever their cooldown.
         internal static double OwnRate(Building b)
         {
+            if (b.Tag == GameTag.Composter)
+                return ManureRate(b);
             if (b.GamePieceWithCount == null || b.Cooldown <= 0)
                 return 0;
             if (IsIrrigated(b))
@@ -577,8 +715,14 @@ namespace CombolandsTweaks
         }
 
         // Average points per turn: one activation's worth (own points and what it triggers) times activations per turn.
-        internal static double TurnValue(Building b, double factor = 1.0) =>
-            (PreviewTotal(b, factor) * Math.Max(1, b.Behaviour.GetActivationCount(b)) + Delivered(b, 1)) * OwnRate(b);
+        internal static double TurnValue(Building b, double factor = 1.0, bool grants = true)
+        {
+            double rate = OwnRate(b);
+            if (rate <= 0)
+                return 0;
+            return (PreviewTotal(b, factor) * Math.Max(1, b.Behaviour.GetActivationCount(b)) + Delivered(b, 1, grants)
+                    + (grants ? GrantValue(b) : 0)) * rate;
+        }
 
         // An existing building's worth in this pass's units.
         private double Value(Building b) => _passPerTurn ? TurnValue(b) : PreviewTotal(b, 1.0);

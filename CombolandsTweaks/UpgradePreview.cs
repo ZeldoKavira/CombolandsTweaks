@@ -666,7 +666,7 @@ namespace CombolandsTweaks
             double own = OwnRate(b);
             _incoming.TryGetValue(b, out double incoming);
             double rate = own + incoming;
-            double points = PointsPerActivation(b);
+            double points = PointsPerActivation(b) + PlacementScores.GrantValue(b);
             value = points * rate;
             double delivered = 0;
             if (Triggerers.ContainsKey(b.Tag) && own > 0)
