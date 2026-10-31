@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using Entities;
 using Entities.Data;
 using Framework;
@@ -21,7 +22,10 @@ namespace CombolandsTweaks
     {
         private const float RefreshInterval = 1f;
 
-        private readonly Dictionary<Tile, long> _scores = new Dictionary<Tile, long>();
+        // A full pass over the map takes ~10-15 ms, so it is spread over frames to avoid hitches.
+        private const double FrameBudgetMs = 2.0;
+
+        private Dictionary<Tile, long> _scores = new Dictionary<Tile, long>();
         private long _best;
 
         private Building _probe;
@@ -32,6 +36,16 @@ namespace CombolandsTweaks
         private int _shownBoard;
         private float _nextRefresh;
         private bool _loggedError;
+
+        // The pass in progress; its results replace _scores when it finishes.
+        private bool _passActive;
+        private bool _passLog;
+        private readonly List<Tile> _passTiles = new List<Tile>();
+        private int _passIndex;
+        private Dictionary<Tile, long> _passScores = new Dictionary<Tile, long>();
+        private long _passBest;
+        private double _passFactor;
+        private readonly Stopwatch _passTime = new Stopwatch();
 
         private GUIStyle _style;
 
@@ -54,18 +68,22 @@ namespace CombolandsTweaks
             }
 
             int board = BoardSignature();
-            if (tag != _shownTag || consumable != _shownConsumable || board != _shownBoard || Time.unscaledTime >= _nextRefresh)
+            bool targetChanged = tag != _shownTag || consumable != _shownConsumable;
+            if (targetChanged)
             {
-                bool changed = tag != _shownTag || board != _shownBoard;
-                var timer = System.Diagnostics.Stopwatch.StartNew();
-                Compute(tag, consumable);
-                if (changed)
-                    Plugin.Log.LogInfo($"Placement scores for {tag}: {_scores.Count} tiles, best {_best} ({timer.Elapsed.TotalMilliseconds:F1} ms)");
+                // Never show one card's numbers for another while the new pass runs.
+                _scores.Clear();
+                _best = 0;
+            }
+            if (targetChanged || board != _shownBoard || (!_passActive && Time.unscaledTime >= _nextRefresh))
+            {
+                StartPass(tag, consumable, log: targetChanged || board != _shownBoard);
                 _shownTag = tag;
                 _shownConsumable = consumable;
                 _shownBoard = board;
-                _nextRefresh = Time.unscaledTime + RefreshInterval;
             }
+            if (_passActive)
+                StepPass();
         }
 
         // Hovering a card in the bottom bar wins; otherwise the building being placed.
@@ -128,58 +146,125 @@ namespace CombolandsTweaks
             }
         }
 
-        private void Compute(GameTag tag, GameTag consumable)
+        private void StartPass(GameTag tag, GameTag consumable, bool log)
         {
-            _scores.Clear();
-            _best = 0;
+            _passActive = false;
+            _passTiles.Clear();
+            _passScores.Clear();
+            _passBest = 0;
+            _passIndex = 0;
+            _passTime.Reset();
             if (!SerializedMonoSingleton<MapController>.HasInstance || !MonoSingleton<BuildingController>.HasInstance)
                 return;
-
-            Building probe = GetProbe(tag);
-            if (probe == null)
+            if (GetProbe(tag) == null)
                 return;
 
-            BuildingController controller = MonoSingleton<BuildingController>.Instance;
-            double consumableFactor = consumable == GameTag.BsNegMult ? 0.5 : 1.0;
             foreach (Tile tile in SerializedMonoSingleton<MapController>.Instance.Grid)
+                if (tile != null)
+                    _passTiles.Add(tile);
+            _passFactor = consumable == GameTag.BsNegMult ? 0.5 : 1.0;
+            _passLog = log;
+            _passActive = true;
+            BuildingExtensions.ResetCaches();
+        }
+
+        private void StepPass()
+        {
+            if (_probe == null || !MonoSingleton<BuildingController>.HasInstance)
             {
-                if (tile == null)
-                    continue;
-                try
-                {
-                    probe.transform.position = new Vector3(tile.X, tile.Y);
-                    BuildingExtensions.ResetCaches();
-                    probe.Values.ResetCaches();
-
-                    if (!controller.CanBuildBuildingAt(probe, tile.X, tile.Y, out CantPlaceBuildingReason reason)
-                        || reason == CantPlaceBuildingReason.NestingDolls)
-                        continue;
-
-                    Dictionary<Tile, long> preview = probe.Behaviour.GetScorePreview(probe);
-                    if (preview == null)
-                        continue;
-                    long sum = 0;
-                    foreach (long v in preview.Values)
-                        sum += v;
-                    long total = (long)Math.Round(sum * probe.Multiplier * consumableFactor);
-                    if (total == 0)
-                        continue;
-                    _scores[tile] = total;
-                    if (total > _best)
-                        _best = total;
-                }
-                catch (Exception e)
-                {
-                    if (!_loggedError)
-                    {
-                        _loggedError = true;
-                        Plugin.Log.LogError($"Scoring {tag} at {tile.X},{tile.Y} failed: {e}");
-                    }
-                }
+                _passActive = false;
+                return;
             }
 
-            // Leave the shared range/adjacency caches as the game expects them: rebuilt on demand.
-            BuildingExtensions.ResetCaches();
+            BuildingController controller = MonoSingleton<BuildingController>.Instance;
+            var frame = Stopwatch.StartNew();
+            _passTime.Start();
+            while (_passIndex < _passTiles.Count && frame.Elapsed.TotalMilliseconds < FrameBudgetMs)
+            {
+                Tile tile = _passTiles[_passIndex++];
+                long total = ScoreAt(_probe, tile, controller, _passFactor);
+                if (total == 0)
+                    continue;
+                _passScores[tile] = total;
+                if (total > _passBest)
+                    _passBest = total;
+            }
+            ForgetProbeCaches(_probe);
+            _passTime.Stop();
+
+            if (_passIndex < _passTiles.Count)
+                return;
+
+            _passActive = false;
+            (_scores, _passScores) = (_passScores, _scores);
+            _best = _passBest;
+            _nextRefresh = Time.unscaledTime + RefreshInterval;
+            if (_passLog)
+                Plugin.Log.LogInfo($"Placement scores for {_probeTag}: {_scores.Count} tiles, best {_best} ({_passTime.Elapsed.TotalMilliseconds:F1} ms)");
+        }
+
+        private long ScoreAt(Building probe, Tile tile, BuildingController controller, double factor)
+        {
+            try
+            {
+                probe.transform.position = new Vector3(tile.X, tile.Y);
+                ForgetProbeCaches(probe);
+
+                if (!controller.CanBuildBuildingAt(probe, tile.X, tile.Y, out CantPlaceBuildingReason reason)
+                    || reason == CantPlaceBuildingReason.NestingDolls)
+                    return 0;
+
+                Dictionary<Tile, long> preview = probe.Behaviour.GetScorePreview(probe);
+                if (preview == null)
+                    return 0;
+                long sum = 0;
+                foreach (long v in preview.Values)
+                    sum += v;
+                return (long)Math.Round(sum * probe.Multiplier * factor);
+            }
+            catch (Exception e)
+            {
+                if (!_loggedError)
+                {
+                    _loggedError = true;
+                    Plugin.Log.LogError($"Scoring {probe.Tag} at {tile.X},{tile.Y} failed: {e}");
+                }
+                return 0;
+            }
+        }
+
+        private static readonly AccessTools.FieldRef<Dictionary<Building, HashSet<Tile>>> AdjacencyCache =
+            AccessTools.StaticFieldRefAccess<Dictionary<Building, HashSet<Tile>>>(AccessTools.Field(typeof(BuildingExtensions), "_adjacencyCache"));
+        private static readonly AccessTools.FieldRef<Dictionary<Building, HashSet<Tile>>> RangeCache =
+            AccessTools.StaticFieldRefAccess<Dictionary<Building, HashSet<Tile>>>(AccessTools.Field(typeof(BuildingExtensions), "_rangeCache"));
+        private static readonly AccessTools.FieldRef<Dictionary<(Building, Tile), HashSet<Tile>>> OverrideTileRangeCache =
+            AccessTools.StaticFieldRefAccess<Dictionary<(Building, Tile), HashSet<Tile>>>(AccessTools.Field(typeof(BuildingExtensions), "_overrideTileRangeCache"));
+        private static readonly AccessTools.FieldRef<Dictionary<(Building, GamePieceCategory), int>> CategoryAdjacencyCache =
+            AccessTools.StaticFieldRefAccess<Dictionary<(Building, GamePieceCategory), int>>(AccessTools.Field(typeof(BuildingExtensions), "_countsOfCategoryAdjacentTo"));
+
+        // The game's range/adjacency caches are keyed by building. Only the probe moves, so dropping just its entries
+        // keeps every other building's cached results valid (BuildingExtensions.ResetCaches per tile was ~20-50 ms).
+        private static void ForgetProbeCaches(Building probe)
+        {
+            AdjacencyCache()?.Remove(probe);
+            RangeCache()?.Remove(probe);
+            RemoveKeys(OverrideTileRangeCache(), k => k.Item1 == probe);
+            RemoveKeys(CategoryAdjacencyCache(), k => k.Item1 == probe);
+            probe.Values.ResetCaches();
+        }
+
+        private static readonly List<object> KeyScratch = new List<object>();
+
+        private static void RemoveKeys<TKey, TValue>(Dictionary<TKey, TValue> dict, Func<TKey, bool> match)
+        {
+            if (dict == null || dict.Count == 0)
+                return;
+            KeyScratch.Clear();
+            foreach (TKey key in dict.Keys)
+                if (match(key))
+                    KeyScratch.Add(key);
+            foreach (object key in KeyScratch)
+                dict.Remove((TKey)key);
         }
 
         // A hidden, never-built copy of the building, the same kind of instance the game creates for its placement
@@ -189,17 +274,35 @@ namespace CombolandsTweaks
             if (_probe != null && _probeTag == tag)
                 return _probe;
             DestroyProbe();
+            if (_failedProbes.Contains(tag))
+                return null;
 
             BuildingData data = ScriptableObjectSingleton<GamePieceDataHolder>.Instance.GetBuildingDataFor(tag);
             if (data == null || data.BuildingPrefab == null)
                 return null;
-            _probe = Instantiate(data.BuildingPrefab, new Vector3(-1000f, -1000f), Quaternion.identity);
-            _probe.name = "CombolandsTweaks score probe";
-            _probe.Init(tag, playerInitiated: true);
-            _probe.gameObject.SetActive(false);
+            // Init reads the cooldown, which for some buildings (e.g. Apiary) looks at neighbouring tiles, so the probe
+            // must start on the map: the middle, like the game's own placement ghost.
+            MapController map = SerializedMonoSingleton<MapController>.Instance;
+            Building probe = Instantiate(data.BuildingPrefab, new Vector3(map.Width / 2, map.Height / 2), Quaternion.identity);
+            probe.name = "CombolandsTweaks score probe";
+            try
+            {
+                probe.Init(tag, playerInitiated: true);
+            }
+            catch (Exception e)
+            {
+                Destroy(probe.gameObject);
+                _failedProbes.Add(tag);
+                Plugin.Log.LogError($"Couldn't create a scoring copy of {tag}: {e}");
+                return null;
+            }
+            probe.gameObject.SetActive(false);
+            _probe = probe;
             _probeTag = tag;
             return _probe;
         }
+
+        private readonly HashSet<GameTag> _failedProbes = new HashSet<GameTag>();
 
         private void DestroyProbe()
         {
@@ -212,6 +315,7 @@ namespace CombolandsTweaks
         private void Clear()
         {
             _scores.Clear();
+            _passActive = false;
             _shownTag = GameTag.None;
         }
 
