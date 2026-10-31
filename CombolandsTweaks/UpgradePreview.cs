@@ -351,6 +351,7 @@ namespace CombolandsTweaks
             try
             {
                 BuildingExtensions.ResetCaches();
+                PlacementScores.ClearSpawnCache();
                 BuildTriggerModel();
                 foreach (Building b in MonoSingleton<BuildingController>.Instance.Buildings)
                 {
