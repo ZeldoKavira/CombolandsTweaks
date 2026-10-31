@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using Entities;
 using Entities.Data;
 using Framework;
@@ -15,15 +16,18 @@ using UnityEngine;
 
 namespace CombolandsTweaks
 {
-    // Shows, on every tile, the points the hovered (or currently placing) building card would score if placed there.
+    // Shows, on every tile, the points the hovered (or currently placing) building card would score if placed there,
+    // marks the best tiles, and puts each card's best score on the card in the bottom bar.
     // Uses the game's own placement preview (Behaviour.GetScorePreview x Multiplier, the green number shown at the
     // cursor while placing) evaluated with a hidden copy of the building moved across the map. Optionally adds what
     // the placement adds to existing buildings' own previews (e.g. Flowers next to an Apiary).
     internal class PlacementScores : MonoBehaviour
     {
         private const float RefreshInterval = 1f;
+        private const int TopCount = 3;
 
-        // A full pass over the map takes 10-25 ms (more with neighbours), so it is spread over frames to avoid hitches.
+        // A full pass over the map takes 10-100 ms (more with neighbours), so passes run in the background, a slice
+        // per frame, one at a time: the hovered/placing building first, then the other cards in the bar.
         private const double FrameBudgetMs = 2.0;
 
         private struct TileScore
@@ -33,28 +37,51 @@ namespace CombolandsTweaks
             public long Total => Own + Nearby;
         }
 
-        private Dictionary<Tile, TileScore> _scores = new Dictionary<Tile, TileScore>();
-        private long _best;
+        private class Result
+        {
+            public Dictionary<Tile, TileScore> Scores;
+            public long Best;
+            public List<Tile> Top;
+            public int Board;
+            public bool Nearby;
+            public float Time;
+        }
+
+        private struct Key : IEquatable<Key>
+        {
+            public GameTag Tag;
+            public GameTag Consumable;
+            public bool Equals(Key other) => Tag == other.Tag && Consumable == other.Consumable;
+            public override bool Equals(object obj) => obj is Key k && Equals(k);
+            public override int GetHashCode() => ((int)Tag * 397) ^ (int)Consumable;
+        }
+
+        private readonly Dictionary<Key, Result> _results = new Dictionary<Key, Result>();
+
+        // True while a building is hovered or being placed, so other overlays can stay out of the way.
+        internal static bool ShowingPlacement;
+
+        // What is on screen this frame.
+        private Key? _target;
+        private bool _placing;
+        private readonly List<(BuildingChoiceButton button, Key key)> _cards = new List<(BuildingChoiceButton, Key)>();
+        private int _board;
+        private bool _nearby;
+        private int _cycleIndex = -1;
 
         private Building _probe;
         private GameTag _probeTag = GameTag.None;
         private readonly HashSet<GameTag> _failedProbes = new HashSet<GameTag>();
-
-        private GameTag _shownTag = GameTag.None;
-        private GameTag _shownConsumable = GameTag.None;
-        private int _shownBoard;
-        private bool _shownNearby;
-        private float _nextRefresh;
         private bool _loggedError;
 
-        // The pass in progress; its results replace _scores when it finishes.
+        // The pass in progress.
         private bool _passActive;
-        private bool _passLog;
+        private Key _passKey;
+        private int _passBoard;
         private bool _passNearby;
         private readonly List<Tile> _passTiles = new List<Tile>();
         private int _passIndex;
         private Dictionary<Tile, TileScore> _passScores = new Dictionary<Tile, TileScore>();
-        private long _passBest;
         private double _passFactor;
         private readonly Stopwatch _passTime = new Stopwatch();
 
@@ -66,6 +93,8 @@ namespace CombolandsTweaks
 
         private GUIStyle _style;
         private GUIStyle _tipStyle;
+        private GUIStyle _badgeStyle;
+        private Texture2D _white;
 
         private void Update()
         {
@@ -75,42 +104,43 @@ namespace CombolandsTweaks
                 Plugin.Log.LogInfo($"Placement score overlay {(Plugin.ScoreOverlayEnabled.Value ? "on" : "off")}");
             }
 
-            GameTag tag = GameTag.None, consumable = GameTag.None;
-            if (Plugin.ScoreOverlayEnabled.Value)
-                FindTarget(out tag, out consumable);
-
-            if (tag == GameTag.None)
+            FindTargets();
+            ShowingPlacement = _target != null;
+            _board = BoardSignature();
+            _nearby = Plugin.ScoreCountNearby.Value;
+            if (_target == null && _cards.Count == 0)
             {
-                Clear();
+                _passActive = false;
                 return;
             }
 
-            int board = BoardSignature();
-            bool nearby = Plugin.ScoreCountNearby.Value;
-            bool targetChanged = tag != _shownTag || consumable != _shownConsumable;
-            if (targetChanged)
+            // A pass for an old board is useless; one for a background card gives way to a target with nothing to show.
+            if (_passActive && (_passBoard != _board || _passNearby != _nearby
+                                || (_target is Key t && !_passKey.Equals(t) && Usable(t) == null)))
+                _passActive = false;
+
+            if (!_passActive)
             {
-                // Never show one card's numbers for another while the new pass runs.
-                _scores.Clear();
-                _best = 0;
-            }
-            if (targetChanged || board != _shownBoard || nearby != _shownNearby || (!_passActive && Time.unscaledTime >= _nextRefresh))
-            {
-                StartPass(tag, consumable, nearby, log: targetChanged || board != _shownBoard);
-                _shownTag = tag;
-                _shownConsumable = consumable;
-                _shownBoard = board;
-                _shownNearby = nearby;
+                Key? next = NextToCompute();
+                if (next is Key k)
+                    StartPass(k);
             }
             if (_passActive)
                 StepPass();
+
+            if (_placing && Plugin.CycleBestKey.Value.IsDown())
+                JumpToNextBest();
         }
 
-        // Hovering a card in the bottom bar wins; otherwise the building being placed.
-        private static void FindTarget(out GameTag tag, out GameTag consumable)
+        // Hovering a card in the bottom bar wins; otherwise the building being placed. The visible cards are queued
+        // for their badges.
+        private void FindTargets()
         {
-            tag = GameTag.None;
-            consumable = GameTag.None;
+            _target = null;
+            _placing = false;
+            _cards.Clear();
+            if (!Plugin.ScoreOverlayEnabled.Value)
+                return;
 
             if (MonoSingleton<BuildingChoiceBar>.HasInstance)
             {
@@ -119,14 +149,22 @@ namespace CombolandsTweaks
                 {
                     foreach (BuildingChoiceButton choice in choices)
                     {
-                        if (choice == null || !choice.isActiveAndEnabled || !IsMouseOver((RectTransform)choice.transform))
+                        if (choice == null || !choice.isActiveAndEnabled || choice.GameTag == GameTag.None)
                             continue;
-                        tag = choice.GameTag;
-                        consumable = choice.BuildingPlaceConsumableWhenCreated != null ? choice.BuildingPlaceConsumableWhenCreated.GetTag() : GameTag.None;
-                        return;
+                        var key = new Key
+                        {
+                            Tag = choice.GameTag,
+                            Consumable = choice.BuildingPlaceConsumableWhenCreated != null ? choice.BuildingPlaceConsumableWhenCreated.GetTag() : GameTag.None,
+                        };
+                        if (Plugin.ScoreCardBadges.Value)
+                            _cards.Add((choice, key));
+                        if (_target == null && IsMouseOver((RectTransform)choice.transform))
+                            _target = key;
                     }
                 }
             }
+            if (_target != null)
+                return;
 
             if (SerializedMonoSingleton<InteractionController>.HasInstance
                 && SerializedMonoSingleton<InteractionController>.Instance.CurrentInteractionState is PlacingBuilding placing)
@@ -134,17 +172,45 @@ namespace CombolandsTweaks
                 Building placed = Traverse.Create(placing).Field<Building>("_currentlyPlacing").Value;
                 if (placed != null)
                 {
-                    tag = placed.Tag;
-                    consumable = placing.ConsumableToApplyWhenCreated;
+                    _target = new Key { Tag = placed.Tag, Consumable = placing.ConsumableToApplyWhenCreated };
+                    _placing = true;
                 }
             }
+            if (_target == null)
+                _cycleIndex = -1;
+        }
+
+        // A result computed for the current board, however old.
+        private Result Usable(Key key)
+        {
+            return _results.TryGetValue(key, out Result r) && r.Board == _board && r.Nearby == _nearby ? r : null;
+        }
+
+        private Key? NextToCompute()
+        {
+            if (_target is Key t)
+            {
+                Result r = Usable(t);
+                // The shown building is refreshed now and then: multipliers can change without the board changing.
+                if (r == null || Time.unscaledTime - r.Time >= RefreshInterval)
+                    return t;
+            }
+            foreach ((BuildingChoiceButton _, Key key) in _cards)
+                if (Usable(key) == null)
+                    return key;
+            return null;
         }
 
         private static bool IsMouseOver(RectTransform rt)
         {
-            Canvas canvas = rt.GetComponentInParent<Canvas>();
-            Camera cam = canvas == null || canvas.rootCanvas.renderMode == RenderMode.ScreenSpaceOverlay ? null : canvas.rootCanvas.worldCamera;
+            Camera cam = CanvasCamera(rt);
             return RectTransformUtility.RectangleContainsScreenPoint(rt, Input.mousePosition, cam);
+        }
+
+        private static Camera CanvasCamera(RectTransform rt)
+        {
+            Canvas canvas = rt.GetComponentInParent<Canvas>();
+            return canvas == null || canvas.rootCanvas.renderMode == RenderMode.ScreenSpaceOverlay ? null : canvas.rootCanvas.worldCamera;
         }
 
         // Cheap fingerprint of the board so the overlay recomputes after a building is placed, moved or removed.
@@ -166,29 +232,33 @@ namespace CombolandsTweaks
             }
         }
 
-        private void StartPass(GameTag tag, GameTag consumable, bool nearby, bool log)
+        private void StartPass(Key key)
         {
             _passActive = false;
             _passTiles.Clear();
-            _passScores.Clear();
-            _passBest = 0;
+            _passScores = new Dictionary<Tile, TileScore>();
             _passIndex = 0;
             _passTime.Reset();
             if (!SerializedMonoSingleton<MapController>.HasInstance || !MonoSingleton<BuildingController>.HasInstance)
                 return;
-            if (GetProbe(tag) == null)
+            if (GetProbe(key.Tag) == null)
+            {
+                // Remember the failure so the queue moves on instead of retrying every frame.
+                _results[key] = new Result { Scores = new Dictionary<Tile, TileScore>(), Top = new List<Tile>(), Board = _board, Nearby = _nearby, Time = float.MaxValue };
                 return;
+            }
 
             foreach (Tile tile in SerializedMonoSingleton<MapController>.Instance.Grid)
                 if (tile != null)
                     _passTiles.Add(tile);
-            _passFactor = consumable == GameTag.BsNegMult ? 0.5 : 1.0;
-            _passNearby = nearby;
-            _passLog = log;
+            _passKey = key;
+            _passBoard = _board;
+            _passNearby = _nearby;
+            _passFactor = key.Consumable == GameTag.BsNegMult ? 0.5 : 1.0;
             _passActive = true;
             _passTime.Start();
             BuildingExtensions.ResetCaches();
-            if (nearby)
+            if (_passNearby)
                 CollectWatchers();
             _passTime.Stop();
         }
@@ -253,11 +323,8 @@ namespace CombolandsTweaks
             while (_passIndex < _passTiles.Count && frame.Elapsed.TotalMilliseconds < FrameBudgetMs)
             {
                 Tile tile = _passTiles[_passIndex++];
-                if (!ScoreAt(_probe, tile, controller, out TileScore score) || score.Total == 0)
-                    continue;
-                _passScores[tile] = score;
-                if (score.Total > _passBest)
-                    _passBest = score.Total;
+                if (ScoreAt(_probe, tile, controller, out TileScore score) && score.Total != 0)
+                    _passScores[tile] = score;
             }
             ForgetCaches(_probe);
             _passTime.Stop();
@@ -266,11 +333,28 @@ namespace CombolandsTweaks
                 return;
 
             _passActive = false;
-            (_scores, _passScores) = (_passScores, _scores);
-            _best = _passBest;
-            _nextRefresh = Time.unscaledTime + RefreshInterval;
-            if (_passLog)
-                Plugin.Log.LogInfo($"Placement scores for {_probeTag}: {_scores.Count} tiles, best {_best} ({_passTime.Elapsed.TotalMilliseconds:F1} ms{(_passNearby ? ", with nearby" : "")})");
+            List<Tile> top = _passScores.Where(e => e.Value.Total > 0).OrderByDescending(e => e.Value.Total).Take(TopCount).Select(e => e.Key).ToList();
+            bool firstForBoard = Usable(_passKey) == null;
+            _results[_passKey] = new Result
+            {
+                Scores = _passScores,
+                Best = top.Count > 0 ? _passScores[top[0]].Total : 0,
+                Top = top,
+                Board = _passBoard,
+                Nearby = _passNearby,
+                Time = Time.unscaledTime,
+            };
+            if (_results.Count > 32)
+                PruneResults();
+            if (firstForBoard)
+                Plugin.Log.LogInfo($"Placement scores for {_passKey.Tag}: {_passScores.Count} tiles, best {_results[_passKey].Best} ({_passTime.Elapsed.TotalMilliseconds:F1} ms{(_passNearby ? ", with nearby" : "")})");
+        }
+
+        private void PruneResults()
+        {
+            foreach (Key k in _results.Keys.ToList())
+                if (_results[k].Board != _board)
+                    _results.Remove(k);
         }
 
         private bool ScoreAt(Building probe, Tile tile, BuildingController controller, out TileScore score)
@@ -298,7 +382,7 @@ namespace CombolandsTweaks
         }
 
         // The game's green placement number: the building's preview points times its multiplier.
-        private static long PreviewTotal(Building b, double factor)
+        internal static long PreviewTotal(Building b, double factor)
         {
             Dictionary<Tile, long> preview = b.Behaviour?.GetScorePreview(b);
             if (preview == null)
@@ -434,16 +518,28 @@ namespace CombolandsTweaks
             _probeTag = GameTag.None;
         }
 
-        private void Clear()
+        // Tab while placing: move the cursor to the best tile, then the 2nd and 3rd best, then round again.
+        private void JumpToNextBest()
         {
-            _scores.Clear();
-            _passActive = false;
-            _shownTag = GameTag.None;
+            Result r = _target is Key t ? Usable(t) : null;
+            Camera cam = Camera.main;
+            if (r == null || r.Top.Count == 0 || cam == null || UnityEngine.InputSystem.Mouse.current == null)
+                return;
+            _cycleIndex = (_cycleIndex + 1) % r.Top.Count;
+            Tile tile = r.Top[_cycleIndex];
+            Vector3 screen = cam.WorldToScreenPoint(new Vector3(tile.X, tile.Y));
+            UnityEngine.InputSystem.Mouse.current.WarpCursorPosition(new Vector2(screen.x, screen.y));
         }
 
         private void OnGUI()
         {
-            if (_scores.Count == 0 || Event.current.type != EventType.Repaint)
+            if (Event.current.type != EventType.Repaint)
+                return;
+            EnsureStyles();
+            DrawCardBadges();
+
+            Result r = _target is Key t ? Usable(t) : null;
+            if (r == null || r.Scores.Count == 0)
                 return;
             Camera cam = Camera.main;
             if (cam == null)
@@ -453,15 +549,13 @@ namespace CombolandsTweaks
             float tilePx = Mathf.Abs(cam.WorldToScreenPoint(Vector3.right).x - cam.WorldToScreenPoint(Vector3.zero).x);
             if (tilePx < 8f)
                 return;
-            if (_style == null)
-            {
-                _style = new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, fontStyle = FontStyle.Bold, clipping = TextClipping.Overflow, wordWrap = false };
-                _tipStyle = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.MiddleLeft, fontStyle = FontStyle.Bold, wordWrap = false };
-                _tipStyle.normal.textColor = Color.white;
-            }
             _style.fontSize = Mathf.Clamp(Mathf.RoundToInt(tilePx * 0.32f * Plugin.ScoreTextScale.Value), 8, 60);
 
-            foreach (KeyValuePair<Tile, TileScore> entry in _scores)
+            int marks = Mathf.Clamp(Plugin.ScoreMarkBest.Value, 0, TopCount);
+            for (int i = 0; i < marks && i < r.Top.Count; i++)
+                DrawTileFrame(cam, r.Top[i], tilePx, i == 0 ? new Color(1f, 0.84f, 0.2f, 0.95f) : new Color(1f, 0.84f, 0.2f, 0.5f), i == 0 ? 3f : 2f);
+
+            foreach (KeyValuePair<Tile, TileScore> entry in r.Scores)
             {
                 // Lower part of the tile, below where the game draws its own per-tile preview numbers.
                 Vector3 screen = cam.WorldToScreenPoint(new Vector3(entry.Key.X, entry.Key.Y - 0.28f));
@@ -473,32 +567,90 @@ namespace CombolandsTweaks
 
                 _style.normal.textColor = new Color(0f, 0f, 0f, 0.85f);
                 GUI.Label(new Rect(rect.x + 1.5f, rect.y + 1.5f, rect.width, rect.height), text, _style);
-                _style.normal.textColor = ColorFor(total);
+                _style.normal.textColor = ColorFor(total, r.Best);
                 GUI.Label(rect, text, _style);
             }
 
             if (Plugin.ScoreShowBreakdown.Value && Plugin.ScoreCountNearby.Value)
-                DrawBreakdown(cam);
+                DrawBreakdown(cam, r);
+        }
+
+        private void EnsureStyles()
+        {
+            if (_style != null)
+                return;
+            _style = new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, fontStyle = FontStyle.Bold, clipping = TextClipping.Overflow, wordWrap = false };
+            _tipStyle = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.MiddleLeft, fontStyle = FontStyle.Bold, wordWrap = false };
+            _tipStyle.normal.textColor = Color.white;
+            _badgeStyle = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.MiddleCenter, fontStyle = FontStyle.Bold, wordWrap = false };
+            _white = Texture2D.whiteTexture;
+        }
+
+        private void DrawTileFrame(Camera cam, Tile tile, float tilePx, Color color, float thickness)
+        {
+            Vector3 c = cam.WorldToScreenPoint(new Vector3(tile.X, tile.Y));
+            float half = tilePx * 0.48f;
+            var rect = new Rect(c.x - half, Screen.height - c.y - half, half * 2f, half * 2f);
+            Color old = GUI.color;
+            GUI.color = color;
+            GUI.DrawTexture(new Rect(rect.x, rect.y, rect.width, thickness), _white);
+            GUI.DrawTexture(new Rect(rect.x, rect.yMax - thickness, rect.width, thickness), _white);
+            GUI.DrawTexture(new Rect(rect.x, rect.y, thickness, rect.height), _white);
+            GUI.DrawTexture(new Rect(rect.xMax - thickness, rect.y, thickness, rect.height), _white);
+            GUI.color = old;
+        }
+
+        // "Best 225" above each card in the bottom bar; the strongest card's badge is gold.
+        private void DrawCardBadges()
+        {
+            if (_cards.Count == 0)
+                return;
+            long top = long.MinValue;
+            foreach ((BuildingChoiceButton _, Key key) in _cards)
+                if (Usable(key) is Result r && r.Best > top)
+                    top = r.Best;
+
+            var corners = new Vector3[4];
+            _badgeStyle.fontSize = Mathf.Clamp(Mathf.RoundToInt(15 * Plugin.ScoreTextScale.Value), 10, 30);
+            foreach ((BuildingChoiceButton button, Key key) in _cards)
+            {
+                if (button == null)
+                    continue;
+                var rt = (RectTransform)button.transform;
+                rt.GetWorldCorners(corners);
+                Camera cam = CanvasCamera(rt);
+                Vector2 bottomLeft = RectTransformUtility.WorldToScreenPoint(cam, corners[0]);
+                Vector2 topRight = RectTransformUtility.WorldToScreenPoint(cam, corners[2]);
+
+                Result r = Usable(key);
+                string text = r == null ? "..." : r.Best > 0 ? $"Best {r.Best}" : "No points";
+                Vector2 size = _badgeStyle.CalcSize(new GUIContent(text));
+                float x = (bottomLeft.x + topRight.x) / 2f - size.x / 2f - 4f;
+                float y = Screen.height - topRight.y - size.y - 8f;
+                _badgeStyle.normal.textColor = r != null && r.Best > 0 && r.Best == top && _cards.Count > 1 ? new Color(1f, 0.84f, 0.2f) : Color.white;
+                GUI.Box(new Rect(x, y, size.x + 8f, size.y + 4f), text, _badgeStyle);
+            }
         }
 
         // Next to the cursor: how the hovered tile's number splits into the building's own points and the bonus to
         // the buildings around it.
-        private void DrawBreakdown(Camera cam)
+        private void DrawBreakdown(Camera cam, Result r)
         {
             Vector3 world = cam.ScreenToWorldPoint(Input.mousePosition);
+            int x = Mathf.RoundToInt(world.x), y = Mathf.RoundToInt(world.y);
             Tile hovered = null;
-            foreach (Tile t in _scores.Keys)
+            foreach (Tile t in r.Scores.Keys)
             {
-                if (t.X == Mathf.RoundToInt(world.x) && t.Y == Mathf.RoundToInt(world.y))
+                if (t.X == x && t.Y == y)
                 {
                     hovered = t;
                     break;
                 }
             }
-            if (hovered == null || _scores[hovered].Nearby == 0)
+            if (hovered == null || r.Scores[hovered].Nearby == 0)
                 return;
 
-            TileScore s = _scores[hovered];
+            TileScore s = r.Scores[hovered];
             string text = $"{s.Own} own  {(s.Nearby > 0 ? "+" : "")}{s.Nearby} nearby";
             _tipStyle.fontSize = Mathf.Clamp(Mathf.RoundToInt(14 * Plugin.ScoreTextScale.Value), 10, 32);
             Vector2 size = _tipStyle.CalcSize(new GUIContent(text));
@@ -507,15 +659,15 @@ namespace CombolandsTweaks
         }
 
         // White for low scores through green, gold for the best tile(s).
-        private Color ColorFor(long score)
+        private static Color ColorFor(long score, long best)
         {
             if (score < 0)
                 return new Color(1f, 0.45f, 0.4f);
-            if (_best <= 0)
+            if (best <= 0)
                 return Color.white;
-            if (score == _best)
+            if (score == best)
                 return new Color(1f, 0.84f, 0.2f);
-            float t = Mathf.Clamp01((float)score / _best);
+            float t = Mathf.Clamp01((float)score / best);
             return Color.Lerp(new Color(0.95f, 0.95f, 0.95f), new Color(0.35f, 1f, 0.35f), t);
         }
 
