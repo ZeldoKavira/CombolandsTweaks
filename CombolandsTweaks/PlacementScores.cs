@@ -32,16 +32,17 @@ namespace CombolandsTweaks
 
         private struct TileScore
         {
-            public long Own;
-            public long Nearby;
+            public double Own;
+            public double Nearby;
             public string Note; // placement bonus that applied (Scaffolding, Nesting Doll, ...)
-            public long Total => Own + Nearby;
+            public double Total => Own + Nearby;
         }
 
         private class Result
         {
             public Dictionary<Tile, TileScore> Scores;
-            public long Best;
+            public double Best;
+            public bool PerTurn;
             public List<Tile> Top;
             public int Board;
             public bool Nearby;
@@ -80,6 +81,8 @@ namespace CombolandsTweaks
         private Key _passKey;
         private int _passBoard;
         private bool _passNearby;
+        private bool _passPerTurn;
+        private bool _perTurn;
         private readonly List<Tile> _passTiles = new List<Tile>();
         private int _passIndex;
         private Dictionary<Tile, TileScore> _passScores = new Dictionary<Tile, TileScore>();
@@ -87,7 +90,7 @@ namespace CombolandsTweaks
         private readonly Stopwatch _passTime = new Stopwatch();
 
         // Existing buildings' own preview totals before the placement, and which of them can see each tile.
-        private readonly Dictionary<Building, long> _baseline = new Dictionary<Building, long>();
+        private readonly Dictionary<Building, double> _baseline = new Dictionary<Building, double>();
         // What each existing triggering building hands out per activation before the placement.
         private readonly Dictionary<Building, double> _deliveredBaseline = new Dictionary<Building, double>();
         // Set by NearbyGain: which existing triggering buildings would also trigger the new one.
@@ -113,6 +116,7 @@ namespace CombolandsTweaks
             ShowingPlacement = _target != null;
             _board = BoardSignature();
             _nearby = Plugin.ScoreCountNearby.Value;
+            _perTurn = Plugin.ScorePerTurn.Value;
             if (_target == null && _cards.Count == 0)
             {
                 _passActive = false;
@@ -120,7 +124,7 @@ namespace CombolandsTweaks
             }
 
             // A pass for an old board is useless; one for a background card gives way to a target with nothing to show.
-            if (_passActive && (_passBoard != _board || _passNearby != _nearby
+            if (_passActive && (_passBoard != _board || _passNearby != _nearby || _passPerTurn != _perTurn
                                 || (_target is Key t && !_passKey.Equals(t) && Usable(t) == null)))
                 _passActive = false;
 
@@ -188,7 +192,7 @@ namespace CombolandsTweaks
         // A result computed for the current board, however old.
         private Result Usable(Key key)
         {
-            return _results.TryGetValue(key, out Result r) && r.Board == _board && r.Nearby == _nearby ? r : null;
+            return _results.TryGetValue(key, out Result r) && r.Board == _board && r.Nearby == _nearby && r.PerTurn == _perTurn ? r : null;
         }
 
         private Key? NextToCompute()
@@ -259,6 +263,7 @@ namespace CombolandsTweaks
             _passKey = key;
             _passBoard = _board;
             _passNearby = _nearby;
+            _passPerTurn = _perTurn;
             _passFactor = key.Consumable == GameTag.BsNegMult ? 0.5 : 1.0;
             _passActive = true;
             _passTime.Start();
@@ -282,7 +287,7 @@ namespace CombolandsTweaks
                     continue;
                 try
                 {
-                    _baseline[b] = PreviewTotal(b, 1.0);
+                    _baseline[b] = Value(b);
                     if (UpgradePreview.Triggerers.ContainsKey(b.Tag))
                         _deliveredBaseline[b] = Delivered(b, 1);
                     if (b.Tag == GameTag.TownHall)
@@ -331,7 +336,7 @@ namespace CombolandsTweaks
             while (_passIndex < _passTiles.Count && frame.Elapsed.TotalMilliseconds < FrameBudgetMs)
             {
                 Tile tile = _passTiles[_passIndex++];
-                if (ScoreAt(_probe, tile, controller, out TileScore score) && score.Total != 0)
+                if (ScoreAt(_probe, tile, controller, out TileScore score) && Math.Abs(score.Total) >= 0.05)
                     _passScores[tile] = score;
             }
             ForgetCaches(_probe);
@@ -350,12 +355,13 @@ namespace CombolandsTweaks
                 Top = top,
                 Board = _passBoard,
                 Nearby = _passNearby,
+                PerTurn = _passPerTurn,
                 Time = Time.unscaledTime,
             };
             if (_results.Count > 32)
                 PruneResults();
             if (firstForBoard)
-                Plugin.Log.LogInfo($"Placement scores for {_passKey.Tag}: {_passScores.Count} tiles, best {_results[_passKey].Best} ({_passTime.Elapsed.TotalMilliseconds:F1} ms{(_passNearby ? ", with nearby" : "")})");
+                Plugin.Log.LogInfo($"Placement scores for {_passKey.Tag}: {_passScores.Count} tiles, best {Fmt(_results[_passKey].Best)}{(_passPerTurn ? "/turn" : "")} ({_passTime.Elapsed.TotalMilliseconds:F1} ms{(_passNearby ? ", with nearby" : "")})");
         }
 
         private void PruneResults()
@@ -393,7 +399,7 @@ namespace CombolandsTweaks
                     ForgetCaches(probe);
                     try
                     {
-                        score.Own = PreviewTotal(probe, _passFactor);
+                        score.Own = OwnValue(probe);
                     }
                     finally
                     {
@@ -403,7 +409,13 @@ namespace CombolandsTweaks
                 }
                 else
                 {
-                    score.Own = PreviewTotal(probe, _passFactor);
+                    score.Own = OwnValue(probe);
+                }
+                if (_passPerTurn && OwnRate(probe) <= 0)
+                {
+                    long once = PreviewTotal(probe, _passFactor);
+                    if (once != 0)
+                        score.Note = Join(score.Note, $"no countdown: {once} per activation when something triggers it");
                 }
 
                 // A building that triggers others (Marketplace -> Stalls, Sawmill, ...) earns their points when it
@@ -411,8 +423,10 @@ namespace CombolandsTweaks
                 long triggered = TriggeredPoints(probe, out int count);
                 if (triggered != 0)
                 {
-                    score.Own += triggered;
-                    score.Note = Join(score.Note, $"triggers {count} building{(count == 1 ? "" : "s")}: +{triggered}");
+                    // Per turn, OwnValue already includes it.
+                    if (!_passPerTurn)
+                        score.Own += triggered;
+                    score.Note = Join(score.Note, $"triggers {count} building{(count == 1 ? "" : "s")}: +{triggered} per activation");
                 }
 
                 if (_passNearby)
@@ -422,10 +436,10 @@ namespace CombolandsTweaks
                         score.Note = Join(score.Note, by);
                     score.Nearby += InventorGain(probe, tile, ref score.Note);
                     // A scoring building that gets built over is lost.
-                    if (tile.Building != null && _baseline.TryGetValue(tile.Building, out long lost) && lost != 0)
+                    if (tile.Building != null && _baseline.TryGetValue(tile.Building, out double lost) && Math.Abs(lost) >= 0.05)
                     {
                         score.Nearby -= lost;
-                        score.Note = Join(score.Note, $"replaces a {NameOf(tile.Building.Tag)} ({lost})");
+                        score.Note = Join(score.Note, $"replaces a {NameOf(tile.Building.Tag)} (-{Fmt(lost)})");
                     }
                 }
                 return true;
@@ -464,7 +478,7 @@ namespace CombolandsTweaks
         }
 
         // Inventor with 4+ council votes: an Engineering building gives every adjacent building extra mult on build.
-        private long InventorGain(Building probe, Tile tile, ref string note)
+        private double InventorGain(Building probe, Tile tile, ref string note)
         {
             if (!SerializedMonoSingleton<CouncilFavour>.HasInstance || !probe.Categories.ContainsCategory(GamePieceCategory.Engineering))
                 return 0;
@@ -472,7 +486,7 @@ namespace CombolandsTweaks
             if (council.GetVotesFor(CouncilCharacter.Inventor) < 4)
                 return 0;
             float mult = council.GetMultParamFor(CouncilCharacter.Inventor);
-            long gain = 0;
+            double gain = 0;
             foreach (Tile t in probe.GetAdjacentTiles())
                 if (t != null && t != tile && !t.IsEmpty && t.Building != null)
                     gain += MultGain(t.Building, mult);
@@ -517,16 +531,16 @@ namespace CombolandsTweaks
         }
 
         // What extra mult adds to an existing building's preview points.
-        private static long MultGain(Building b, float mult)
+        private double MultGain(Building b, float mult)
         {
             if (b == null || b.Values == null || !b.Tag.CanGetMult())
                 return 0;
-            long before = PreviewTotal(b, 1.0);
+            double before = Value(b);
             LocalMult(b.Values) += mult;
             ForgetCaches(b);
             try
             {
-                return PreviewTotal(b, 1.0) - before;
+                return Value(b) - before;
             }
             finally
             {
@@ -539,6 +553,21 @@ namespace CombolandsTweaks
 
         private static string NameOf(GameTag tag) =>
             ScriptableObjectSingleton<StringLookup>.Instance.GetNameForTag(tag, out string name) ? name : tag.ToString();
+
+        // Activations per turn from the building's own countdown (Lamppost-style cooldown cuts show up here).
+        internal static double OwnRate(Building b) => b.GamePieceWithCount != null && b.Cooldown > 0 ? 1.0 / b.Cooldown : 0;
+
+        // Average points per turn: one activation's worth (own points and what it triggers) times activations per turn.
+        internal static double TurnValue(Building b, double factor = 1.0) =>
+            (PreviewTotal(b, factor) * Math.Max(1, b.Behaviour.GetActivationCount(b)) + Delivered(b, 1)) * OwnRate(b);
+
+        // An existing building's worth in this pass's units.
+        private double Value(Building b) => _passPerTurn ? TurnValue(b) : PreviewTotal(b, 1.0);
+
+        private double OwnValue(Building probe) => _passPerTurn ? TurnValue(probe, _passFactor) : PreviewTotal(probe, _passFactor);
+
+        // Whole numbers from 10 up, one decimal below.
+        internal static string Fmt(double v) => Math.Abs(v) >= 10 ? Math.Round(v).ToString("0") : v.ToString("0.#");
 
         // The game's green placement number: the building's preview points times its multiplier.
         internal static long PreviewTotal(Building b, double factor)
@@ -553,7 +582,7 @@ namespace CombolandsTweaks
         }
 
         // Puts the probe on the tile for a moment and re-runs the preview of every existing building that can see it.
-        private long NearbyGain(Building probe, Tile tile)
+        private double NearbyGain(Building probe, Tile tile)
         {
             _candidates.Clear();
             _triggeredBy.Clear();
@@ -566,25 +595,29 @@ namespace CombolandsTweaks
                 return 0;
 
             Building previous = tile.Building;
-            long gain = 0;
+            double gain = 0;
             tile.AssignBuilding(probe);
             try
             {
                 foreach (Building b in _candidates)
                 {
                     // Something built over is replaced, not boosted.
-                    if (b == previous || b == null || !_baseline.TryGetValue(b, out long before))
+                    if (b == previous || b == null || !_baseline.TryGetValue(b, out double before))
                         continue;
                     ForgetCaches(b);
-                    gain += PreviewTotal(b, 1.0) - before;
+                    gain += Value(b) - before;
                     // An existing triggering building that would now also pick the new one: what it hands out per
                     // activation changes (the new building's value, minus what random-pickers stop giving others).
                     if (_deliveredBaseline.TryGetValue(b, out double deliveredBefore) && UpgradePreview.Candidates(b).Contains(probe))
                     {
                         double delta = Delivered(b, 1) - deliveredBefore;
-                        gain += (long)Math.Round(delta);
-                        if (Math.Abs(delta) >= 0.5)
-                            _triggeredBy.Add($"{NameOf(b.Tag)} triggers it ({(delta > 0 ? "+" : "")}{Math.Round(delta)})");
+                        // Per turn, Value(b) already counts what it hands out, scaled by how often it activates.
+                        if (_passPerTurn)
+                            delta *= OwnRate(b);
+                        else
+                            gain += delta;
+                        if (Math.Abs(delta) >= 0.05)
+                            _triggeredBy.Add($"{NameOf(b.Tag)} triggers it ({(delta > 0 ? "+" : "")}{Fmt(delta)})");
                     }
                 }
             }
@@ -731,8 +764,8 @@ namespace CombolandsTweaks
                 if (screen.z < 0f)
                     continue;
                 Rect rect = new Rect(screen.x - tilePx / 2f, Screen.height - screen.y - tilePx / 4f, tilePx, tilePx / 2f);
-                long total = entry.Value.Total;
-                string text = total.ToString();
+                double total = entry.Value.Total;
+                string text = Fmt(total);
 
                 _style.normal.textColor = new Color(0f, 0f, 0f, 0.85f);
                 GUI.Label(new Rect(rect.x + 1.5f, rect.y + 1.5f, rect.width, rect.height), text, _style);
@@ -774,7 +807,7 @@ namespace CombolandsTweaks
         {
             if (_cards.Count == 0)
                 return;
-            long top = long.MinValue;
+            double top = double.MinValue;
             foreach ((BuildingChoiceButton _, Key key) in _cards)
                 if (Usable(key) is Result r && r.Best > top)
                     top = r.Best;
@@ -792,7 +825,7 @@ namespace CombolandsTweaks
                 Vector2 topRight = RectTransformUtility.WorldToScreenPoint(cam, corners[2]);
 
                 Result r = Usable(key);
-                string text = r == null ? "..." : r.Best > 0 ? $"Best {r.Best}" : "No points";
+                string text = r == null ? "..." : r.Best > 0 ? $"Best {Fmt(r.Best)}{(r.PerTurn ? "/turn" : "")}" : "No points";
                 Vector2 size = _badgeStyle.CalcSize(new GUIContent(text));
                 float x = (bottomLeft.x + topRight.x) / 2f - size.x / 2f - 4f;
                 float y = Screen.height - topRight.y - size.y - 8f;
@@ -820,7 +853,9 @@ namespace CombolandsTweaks
                 return;
 
             TileScore s = r.Scores[hovered];
-            string text = s.Nearby != 0 ? $"{s.Own} own  {(s.Nearby > 0 ? "+" : "")}{s.Nearby} nearby" : $"{s.Own}";
+            string text = s.Nearby != 0 ? $"{Fmt(s.Own)} own  {(s.Nearby > 0 ? "+" : "")}{Fmt(s.Nearby)} nearby" : Fmt(s.Own);
+            if (r.PerTurn)
+                text += " (per turn)";
             if (s.Note != null)
                 text += "\n" + s.Note;
             _tipStyle.fontSize = Mathf.Clamp(Mathf.RoundToInt(14 * Plugin.ScoreTextScale.Value), 10, 32);
@@ -830,15 +865,15 @@ namespace CombolandsTweaks
         }
 
         // White for low scores through green, gold for the best tile(s).
-        private static Color ColorFor(long score, long best)
+        private static Color ColorFor(double score, double best)
         {
             if (score < 0)
                 return new Color(1f, 0.45f, 0.4f);
             if (best <= 0)
                 return Color.white;
-            if (score == best)
+            if (Math.Abs(score - best) < 1e-6)
                 return new Color(1f, 0.84f, 0.2f);
-            float t = Mathf.Clamp01((float)score / best);
+            float t = Mathf.Clamp01((float)(score / best));
             return Color.Lerp(new Color(0.95f, 0.95f, 0.95f), new Color(0.35f, 1f, 0.35f), t);
         }
 

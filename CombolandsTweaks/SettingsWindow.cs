@@ -39,6 +39,8 @@ namespace CombolandsTweaks
             GUI.enabled = Plugin.ScoreOverlayEnabled.Value;
             Plugin.ScoreCountNearby.Value = GUILayout.Toggle(Plugin.ScoreCountNearby.Value,
                 " Include the bonus to nearby buildings");
+            Plugin.ScorePerTurn.Value = GUILayout.Toggle(Plugin.ScorePerTurn.Value,
+                " Average points per turn (off: points per activation)");
             Plugin.ScoreShowBreakdown.Value = GUILayout.Toggle(Plugin.ScoreShowBreakdown.Value,
                 " Show own / nearby split at the cursor");
             Plugin.ScoreCardBadges.Value = GUILayout.Toggle(Plugin.ScoreCardBadges.Value,
