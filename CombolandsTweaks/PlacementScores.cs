@@ -88,6 +88,10 @@ namespace CombolandsTweaks
 
         // Existing buildings' own preview totals before the placement, and which of them can see each tile.
         private readonly Dictionary<Building, long> _baseline = new Dictionary<Building, long>();
+        // What each existing triggering building hands out per activation before the placement.
+        private readonly Dictionary<Building, double> _deliveredBaseline = new Dictionary<Building, double>();
+        // Set by NearbyGain: which existing triggering buildings would also trigger the new one.
+        private readonly List<string> _triggeredBy = new List<string>();
         private readonly Dictionary<Tile, List<Building>> _watchers = new Dictionary<Tile, List<Building>>();
         private readonly List<Building> _alwaysWatch = new List<Building>();
         private readonly List<Building> _candidates = new List<Building>();
@@ -269,6 +273,7 @@ namespace CombolandsTweaks
         private void CollectWatchers()
         {
             _baseline.Clear();
+            _deliveredBaseline.Clear();
             _watchers.Clear();
             _alwaysWatch.Clear();
             foreach (Building b in MonoSingleton<BuildingController>.Instance.Buildings)
@@ -278,6 +283,8 @@ namespace CombolandsTweaks
                 try
                 {
                     _baseline[b] = PreviewTotal(b, 1.0);
+                    if (UpgradePreview.Triggerers.ContainsKey(b.Tag))
+                        _deliveredBaseline[b] = Delivered(b, 1);
                     if (b.Tag == GameTag.TownHall)
                     {
                         // Scores a contiguous residential block, which can reach beyond its adjacent tiles.
@@ -411,6 +418,8 @@ namespace CombolandsTweaks
                 if (_passNearby)
                 {
                     score.Nearby = NearbyGain(probe, tile);
+                    foreach (string by in _triggeredBy)
+                        score.Note = Join(score.Note, by);
                     score.Nearby += InventorGain(probe, tile, ref score.Note);
                     // A scoring building that gets built over is lost.
                     if (tile.Building != null && _baseline.TryGetValue(tile.Building, out long lost) && lost != 0)
@@ -481,11 +490,30 @@ namespace CombolandsTweaks
                 return 0;
             List<Building> targets = UpgradePreview.Candidates(probe);
             count = targets.Count;
-            double share = UpgradePreview.Share(probe, targets);
+            return (long)Math.Round(Delivered(probe, 1));
+        }
+
+        // Points a triggering building hands out per activation: each target's activation value times the chance it
+        // gets picked. A target that triggers others passes its own deliveries on, down to `depth` more steps.
+        internal static double Delivered(Building t, int depth)
+        {
+            if (!UpgradePreview.Triggerers.ContainsKey(t.Tag))
+                return 0;
+            List<Building> targets = UpgradePreview.Candidates(t);
+            double share = UpgradePreview.Share(t, targets);
             double points = 0;
             foreach (Building x in targets)
-                points += share * PreviewTotal(x, 1.0) * Math.Max(1, x.Behaviour.GetActivationCount(x));
-            return (long)Math.Round(points);
+                points += share * ActivationValue(x, depth);
+            return points;
+        }
+
+        // Points one activation of a building is worth: its own preview times activations, plus what it triggers.
+        internal static double ActivationValue(Building x, int depth)
+        {
+            double value = PreviewTotal(x, 1.0) * Math.Max(1, x.Behaviour.GetActivationCount(x));
+            if (depth > 0)
+                value += Delivered(x, depth - 1);
+            return value;
         }
 
         // What extra mult adds to an existing building's preview points.
@@ -528,6 +556,7 @@ namespace CombolandsTweaks
         private long NearbyGain(Building probe, Tile tile)
         {
             _candidates.Clear();
+            _triggeredBy.Clear();
             if (_watchers.TryGetValue(tile, out List<Building> watching))
                 _candidates.AddRange(watching);
             foreach (Building b in _alwaysWatch)
@@ -548,6 +577,15 @@ namespace CombolandsTweaks
                         continue;
                     ForgetCaches(b);
                     gain += PreviewTotal(b, 1.0) - before;
+                    // An existing triggering building that would now also pick the new one: what it hands out per
+                    // activation changes (the new building's value, minus what random-pickers stop giving others).
+                    if (_deliveredBaseline.TryGetValue(b, out double deliveredBefore) && UpgradePreview.Candidates(b).Contains(probe))
+                    {
+                        double delta = Delivered(b, 1) - deliveredBefore;
+                        gain += (long)Math.Round(delta);
+                        if (Math.Abs(delta) >= 0.5)
+                            _triggeredBy.Add($"{NameOf(b.Tag)} triggers it ({(delta > 0 ? "+" : "")}{Math.Round(delta)})");
+                    }
                 }
             }
             finally

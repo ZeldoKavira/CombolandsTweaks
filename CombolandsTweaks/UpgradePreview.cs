@@ -28,6 +28,7 @@ namespace CombolandsTweaks
             public double Now;
             public double After;
             public bool PerTurn;
+            public int Affected; // paints: other buildings whose points change
         }
 
         private readonly Dictionary<Building, Row> _rows = new Dictionary<Building, Row>();
@@ -50,6 +51,17 @@ namespace CombolandsTweaks
 
         private static bool IsStatUpgrade(GameTag tag) =>
             tag == GameTag.BsStatModMult || tag == GameTag.BsStatModCooldown || tag == GameTag.BsStatModRange || tag == GameTag.BsStatModActivationCount;
+
+        // Paints whose effect is just being painted (Wild = rainbow changes the major category). Ghost paint asks for
+        // a category first and black paint is a penalty, so neither is previewed.
+        private static bool IsPaint(GameTag tag) =>
+            tag == GameTag.BsRainbowPaint || tag == GameTag.BsRedPaint || tag == GameTag.BsGoldPaint || tag == GameTag.BsGreenPaint
+            || tag == GameTag.BsBluePaint || tag == GameTag.BsWhitePaint || tag == GameTag.BsPurplePaint;
+
+        private static bool IsSupported(GameTag tag) => IsStatUpgrade(tag) || IsPaint(tag);
+
+        private static readonly AccessTools.FieldRef<BuildingPaint, GameTag> PaintTag = AccessTools.FieldRefAccess<BuildingPaint, GameTag>("_paintTag");
+        private static readonly AccessTools.FieldRef<GamePieceLocalValues, GamePieceCategory> MajorOverride = AccessTools.FieldRefAccess<GamePieceLocalValues, GamePieceCategory>("_localOverrideMajorCategory");
 
         private void Update()
         {
@@ -79,6 +91,13 @@ namespace CombolandsTweaks
                 if (IsStatUpgrade(stat))
                     return stat;
             }
+            if (SerializedMonoSingleton<InteractionController>.HasInstance
+                && SerializedMonoSingleton<InteractionController>.Instance.CurrentInteractionState is PaintingBuilding painting)
+            {
+                GameTag paint = Traverse.Create(painting).Field<GameTag>("_paintTag").Value;
+                if (IsPaint(paint))
+                    return paint;
+            }
 
             if (Time.unscaledTime >= _nextFind)
             {
@@ -87,14 +106,14 @@ namespace CombolandsTweaks
                 _shopItems = FindObjectsByType<ShopSingle>(FindObjectsSortMode.None);
             }
             foreach (Consumable c in _consumables)
-                if (c != null && c.isActiveAndEnabled && IsStatUpgrade(c.GameTag) && IsMouseOver(c.transform as RectTransform))
+                if (c != null && c.isActiveAndEnabled && IsSupported(c.GameTag) && IsMouseOver(c.transform as RectTransform))
                     return c.GameTag;
             foreach (ShopSingle s in _shopItems)
             {
                 if (s == null || !s.isActiveAndEnabled || s.ItemType != GameItemType.BuildingUpgrade)
                     continue;
                 GameTag t = Traverse.Create(s).Field<GameTag>("_tag").Value;
-                if (IsStatUpgrade(t) && IsMouseOver(s.transform as RectTransform))
+                if (IsSupported(t) && IsMouseOver(s.transform as RectTransform))
                     return t;
             }
             return GameTag.None;
@@ -115,9 +134,14 @@ namespace CombolandsTweaks
             _bestGain = 0;
             if (!MonoSingleton<BuildingController>.HasInstance)
                 return;
-            float amount = ConsumableBehaviour.GetBuildingSupplyParam(tag);
             BuildingExtensions.ResetCaches();
             BuildTriggerModel();
+            if (IsPaint(tag))
+            {
+                ComputePaint(tag);
+                return;
+            }
+            float amount = ConsumableBehaviour.GetBuildingSupplyParam(tag);
             foreach (Building b in MonoSingleton<BuildingController>.Instance.Buildings)
             {
                 if (b == null || b.Values == null || !b.isActiveAndEnabled)
@@ -159,6 +183,95 @@ namespace CombolandsTweaks
                     }
                 }
             }
+        }
+
+        // A paint changes how other buildings see the painted one (a Wild building counts as every category), so the
+        // figure is the points per turn of the painted building plus every building whose range or adjacency covers it.
+        private void ComputePaint(GameTag paint)
+        {
+            List<Building> all = MonoSingleton<BuildingController>.Instance.Buildings;
+            var watchers = new Dictionary<Tile, List<Building>>();
+            var townHalls = new List<Building>();
+            foreach (Building w in all)
+            {
+                if (w == null || w.Values == null || !w.isActiveAndEnabled)
+                    continue;
+                if (w.Tag == GameTag.TownHall)
+                    townHalls.Add(w);
+                foreach (HashSet<Tile> tiles in new[] { w.GetTilesInRange(), w.GetAdjacentTiles() })
+                    foreach (Tile t in tiles)
+                    {
+                        if (t == null)
+                            continue;
+                        if (!watchers.TryGetValue(t, out List<Building> list))
+                            watchers[t] = list = new List<Building>();
+                        if (!list.Contains(w))
+                            list.Add(w);
+                    }
+            }
+
+            foreach (Building b in all)
+            {
+                if (b == null || b.Values == null || b.BuildingPaint == null || !b.isActiveAndEnabled)
+                    continue;
+                try
+                {
+                    if (!ConsumableBehaviour.CanUseConsumableOn(paint, b.Tile))
+                        continue;
+                    var affected = new List<Building> { b };
+                    if (watchers.TryGetValue(b.Tile, out List<Building> seeing))
+                        foreach (Building w in seeing)
+                            if (!affected.Contains(w))
+                                affected.Add(w);
+                    foreach (Building w in townHalls)
+                        if (!affected.Contains(w))
+                            affected.Add(w);
+
+                    Row row = default;
+                    row.PerTurn = true;
+                    row.Affected = affected.Count - 1;
+                    row.Now = SumAttributed(affected);
+
+                    GameTag oldPaint = PaintTag(b.BuildingPaint);
+                    GamePieceCategory oldMajor = MajorOverride(b.Values);
+                    PaintTag(b.BuildingPaint) = paint;
+                    if (paint == GameTag.BsRainbowPaint)
+                        MajorOverride(b.Values) = GamePieceCategory.Wild;
+                    try
+                    {
+                        BuildingExtensions.ResetCaches();
+                        row.After = SumAttributed(affected);
+                    }
+                    finally
+                    {
+                        PaintTag(b.BuildingPaint) = oldPaint;
+                        MajorOverride(b.Values) = oldMajor;
+                        BuildingExtensions.ResetCaches();
+                    }
+                    if (Math.Abs(row.After - row.Now) < 0.05)
+                        continue;
+                    _rows[b] = row;
+                    if (row.After - row.Now > _bestGain)
+                        _bestGain = row.After - row.Now;
+                }
+                catch (Exception e)
+                {
+                    if (!_loggedError)
+                    {
+                        _loggedError = true;
+                        Plugin.Log.LogError($"Paint preview for {b.Tag} at {b.X},{b.Y} failed: {e}");
+                    }
+                }
+            }
+        }
+
+        private double SumAttributed(List<Building> buildings)
+        {
+            double sum = 0;
+            foreach (Building x in buildings)
+                if (Attributed(x, out double v, out _))
+                    sum += v;
+            return sum;
         }
 
         // Only the stored change: no notification text, effects or quest progress like AddLocalStatChange.
@@ -343,13 +456,7 @@ namespace CombolandsTweaks
             value = points * rate;
             double delivered = 0;
             if (Triggerers.ContainsKey(b.Tag) && own > 0)
-            {
-                List<Building> targets = Candidates(b);
-                double share = Share(b, targets);
-                foreach (Building x in targets)
-                    if (_points.TryGetValue(x, out double p))
-                        delivered += own * share * p;
-            }
+                delivered = own * PlacementScores.Delivered(b, 1);
             value += delivered;
             perTurn = true;
             if (rate > 0 || delivered > 0)
@@ -466,7 +573,9 @@ namespace CombolandsTweaks
         {
             double gain = r.After - r.Now;
             string how;
-            if (!r.PerTurn)
+            if (IsPaint(_shownTag))
+                how = $"points per turn of it and the {r.Affected} building{(r.Affected == 1 ? "" : "s")} around it that it counts for";
+            else if (!r.PerTurn)
                 how = $"points per activation (triggered by {(_eventTriggeredBy.TryGetValue(b, out string by) ? by : "a neighbour")} when it reacts)";
             else
             {
