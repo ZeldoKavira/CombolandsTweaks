@@ -45,6 +45,10 @@ namespace CombolandsTweaks
             public double Best;
             public bool PerTurn;
             public List<Tile> Top;
+            // Cards that place several copies: the greedy best set of tiles, each copy's gain given the ones before.
+            public List<Tile> Plan = new List<Tile>();
+            public List<double> PlanGains = new List<double>();
+            public double PlanTotal;
             public int Board;
             public bool Nearby;
             public float Time;
@@ -54,9 +58,10 @@ namespace CombolandsTweaks
         {
             public GameTag Tag;
             public GameTag Consumable;
-            public bool Equals(Key other) => Tag == other.Tag && Consumable == other.Consumable;
+            public int Count; // copies to place
+            public bool Equals(Key other) => Tag == other.Tag && Consumable == other.Consumable && Count == other.Count;
             public override bool Equals(object obj) => obj is Key k && Equals(k);
-            public override int GetHashCode() => ((int)Tag * 397) ^ (int)Consumable;
+            public override int GetHashCode() => (((int)Tag * 397) ^ (int)Consumable) * 31 + Count;
         }
 
         private readonly Dictionary<Key, Result> _results = new Dictionary<Key, Result>();
@@ -90,6 +95,16 @@ namespace CombolandsTweaks
         private double _passFactor;
         private readonly Stopwatch _passTime = new Stopwatch();
 
+        // Multi-placement: the copies already planned sit on their tiles as hidden buildings during each slice (and
+        // only then), so later copies are scored with them in place.
+        private int _passStage;
+        private bool _needWatchers;
+        private Dictionary<Tile, TileScore> _stage0Scores;
+        private readonly List<Building> _ghosts = new List<Building>();
+        private readonly List<Tile> _ghostTiles = new List<Tile>();
+        private readonly List<Building> _ghostPrevious = new List<Building>();
+        private readonly List<double> _planGains = new List<double>();
+
         // Existing buildings' own preview totals before the placement, and which of them can see each tile.
         private readonly Dictionary<Building, double> _baseline = new Dictionary<Building, double>();
         // What each existing triggering building hands out per activation before the placement.
@@ -120,14 +135,14 @@ namespace CombolandsTweaks
             _perTurn = Plugin.ScorePerTurn.Value;
             if (_target == null && _cards.Count == 0)
             {
-                _passActive = false;
+                CancelPass();
                 return;
             }
 
             // A pass for an old board is useless; one for a background card gives way to a target with nothing to show.
             if (_passActive && (_passBoard != _board || _passNearby != _nearby || _passPerTurn != _perTurn
                                 || (_target is Key t && !_passKey.Equals(t) && Usable(t) == null)))
-                _passActive = false;
+                CancelPass();
 
             if (!_passActive)
             {
@@ -161,10 +176,12 @@ namespace CombolandsTweaks
                     {
                         if (choice == null || !choice.isActiveAndEnabled || choice.GameTag == GameTag.None)
                             continue;
+                        BuildingPlacementCount count = Traverse.Create(choice).Field<BuildingPlacementCount>("_placementCount").Value;
                         var key = new Key
                         {
                             Tag = choice.GameTag,
                             Consumable = choice.BuildingPlaceConsumableWhenCreated != null ? choice.BuildingPlaceConsumableWhenCreated.GetTag() : GameTag.None,
+                            Count = Copies(count != null ? count.PlacementCount : 1),
                         };
                         if (Plugin.ScoreCardBadges.Value)
                             _cards.Add((choice, key));
@@ -182,13 +199,17 @@ namespace CombolandsTweaks
                 Building placed = Traverse.Create(placing).Field<Building>("_currentlyPlacing").Value;
                 if (placed != null)
                 {
-                    _target = new Key { Tag = placed.Tag, Consumable = placing.ConsumableToApplyWhenCreated };
+                    int remaining = Traverse.Create(placing).Field<int>("_countRemainingToPlace").Value;
+                    _target = new Key { Tag = placed.Tag, Consumable = placing.ConsumableToApplyWhenCreated, Count = Copies(remaining) };
                     _placing = true;
                 }
             }
             if (_target == null)
                 _cycleIndex = -1;
         }
+
+        // Copies worth planning for; 1 when multi-placement planning is off.
+        private static int Copies(int count) => Plugin.ScorePlanMultiple.Value ? Mathf.Clamp(count, 1, 6) : 1;
 
         // A result computed for the current board, however old.
         private Result Usable(Key key)
@@ -242,9 +263,19 @@ namespace CombolandsTweaks
             }
         }
 
-        private void StartPass(Key key)
+        private void CancelPass()
         {
             _passActive = false;
+            ClearGhosts();
+        }
+
+        private void StartPass(Key key)
+        {
+            CancelPass();
+            _passStage = 0;
+            _needWatchers = false;
+            _stage0Scores = null;
+            _planGains.Clear();
             _passTiles.Clear();
             _passScores = new Dictionary<Tile, TileScore>();
             _passIndex = 0;
@@ -282,7 +313,7 @@ namespace CombolandsTweaks
             _deliveredBaseline.Clear();
             _watchers.Clear();
             _alwaysWatch.Clear();
-            foreach (Building b in MonoSingleton<BuildingController>.Instance.Buildings)
+            foreach (Building b in MonoSingleton<BuildingController>.Instance.Buildings.Concat(_ghosts))
             {
                 if (b == null || b == _probe)
                     continue;
@@ -327,42 +358,137 @@ namespace CombolandsTweaks
         {
             if (_probe == null || !MonoSingleton<BuildingController>.HasInstance)
             {
-                _passActive = false;
+                CancelPass();
                 return;
             }
 
             BuildingController controller = MonoSingleton<BuildingController>.Instance;
             var frame = Stopwatch.StartNew();
             _passTime.Start();
-            while (_passIndex < _passTiles.Count && frame.Elapsed.TotalMilliseconds < FrameBudgetMs)
+            PlaceGhosts();
+            try
             {
-                Tile tile = _passTiles[_passIndex++];
-                if (ScoreAt(_probe, tile, controller, out TileScore score) && Math.Abs(score.Total) >= 0.05)
-                    _passScores[tile] = score;
+                if (_needWatchers)
+                {
+                    _needWatchers = false;
+                    if (_passNearby)
+                        CollectWatchers();
+                }
+                while (_passIndex < _passTiles.Count && frame.Elapsed.TotalMilliseconds < FrameBudgetMs)
+                {
+                    Tile tile = _passTiles[_passIndex++];
+                    if (_ghostTiles.Contains(tile))
+                        continue;
+                    if (ScoreAt(_probe, tile, controller, out TileScore score) && Math.Abs(score.Total) >= 0.05)
+                        _passScores[tile] = score;
+                }
+                ForgetCaches(_probe);
             }
-            ForgetCaches(_probe);
-            _passTime.Stop();
+            finally
+            {
+                LiftGhosts();
+                _passTime.Stop();
+            }
 
             if (_passIndex < _passTiles.Count)
                 return;
 
-            _passActive = false;
-            List<Tile> top = _passScores.Where(e => e.Value.Total > 0).OrderByDescending(e => e.Value.Total).Take(TopCount).Select(e => e.Key).ToList();
-            bool firstForBoard = Usable(_passKey) == null;
-            _results[_passKey] = new Result
+            // One stage done: note this copy's best tile; plan the next copy with this one in place.
+            if (_passStage == 0)
+                _stage0Scores = _passScores;
+            KeyValuePair<Tile, TileScore> best = _passScores.Where(e => e.Value.Total > 0).OrderByDescending(e => e.Value.Total).FirstOrDefault();
+            if (best.Key != null)
             {
-                Scores = _passScores,
-                Best = top.Count > 0 ? _passScores[top[0]].Total : 0,
+                _planGains.Add(best.Value.Total);
+                if (_passStage + 1 < _passKey.Count && AddGhost(best.Key))
+                {
+                    _passStage++;
+                    _passIndex = 0;
+                    _passScores = new Dictionary<Tile, TileScore>();
+                    _needWatchers = true;
+                    return;
+                }
+                _ghostTiles.Add(best.Key); // the last copy's tile, for the plan (no ghost needed)
+            }
+
+            _passActive = false;
+            Dictionary<Tile, TileScore> scores = _stage0Scores ?? _passScores;
+            List<Tile> top = scores.Where(e => e.Value.Total > 0).OrderByDescending(e => e.Value.Total).Take(TopCount).Select(e => e.Key).ToList();
+            bool firstForBoard = Usable(_passKey) == null;
+            var result = new Result
+            {
+                Scores = scores,
+                Best = top.Count > 0 ? scores[top[0]].Total : 0,
                 Top = top,
                 Board = _passBoard,
                 Nearby = _passNearby,
                 PerTurn = _passPerTurn,
                 Time = Time.unscaledTime,
             };
+            if (_passKey.Count > 1)
+            {
+                result.Plan.AddRange(_ghostTiles);
+                result.PlanGains.AddRange(_planGains);
+                result.PlanTotal = _planGains.Sum();
+            }
+            _results[_passKey] = result;
+            ClearGhosts();
             if (_results.Count > 32)
                 PruneResults();
             if (firstForBoard)
-                Plugin.Log.LogInfo($"Placement scores for {_passKey.Tag}: {_passScores.Count} tiles, best {Fmt(_results[_passKey].Best)}{(_passPerTurn ? "/turn" : "")} ({_passTime.Elapsed.TotalMilliseconds:F1} ms{(_passNearby ? ", with nearby" : "")})");
+                Plugin.Log.LogInfo($"Placement scores for {_passKey.Tag}: {scores.Count} tiles, best {Fmt(result.Best)}{(_passPerTurn ? "/turn" : "")}"
+                                   + (_passKey.Count > 1 ? $", {result.Plan.Count} placements {Fmt(result.PlanTotal)}" : "")
+                                   + $" ({_passTime.Elapsed.TotalMilliseconds:F1} ms{(_passNearby ? ", with nearby" : "")})");
+        }
+
+        private bool AddGhost(Tile tile)
+        {
+            Building ghost = CreateCopy(_passKey.Tag);
+            if (ghost == null)
+                return false;
+            ghost.name = "CombolandsTweaks planned copy";
+            ghost.transform.position = new Vector3(tile.X, tile.Y);
+            _ghosts.Add(ghost);
+            _ghostTiles.Add(tile);
+            _ghostPrevious.Add(null);
+            return true;
+        }
+
+        private void PlaceGhosts()
+        {
+            if (_ghosts.Count == 0)
+                return;
+            for (int i = 0; i < _ghosts.Count; i++)
+            {
+                _ghostPrevious[i] = _ghostTiles[i].Building;
+                _ghostTiles[i].AssignBuilding(_ghosts[i]);
+            }
+            BuildingExtensions.ResetCaches();
+        }
+
+        private void LiftGhosts()
+        {
+            if (_ghosts.Count == 0)
+                return;
+            for (int i = _ghosts.Count - 1; i >= 0; i--)
+            {
+                if (_ghostPrevious[i] != null)
+                    _ghostTiles[i].AssignBuilding(_ghostPrevious[i]);
+                else
+                    _ghostTiles[i].RemoveCurrentBuilding();
+                _ghostPrevious[i] = null;
+            }
+            BuildingExtensions.ResetCaches();
+        }
+
+        private void ClearGhosts()
+        {
+            foreach (Building g in _ghosts)
+                if (g != null)
+                    Destroy(g.gameObject);
+            _ghosts.Clear();
+            _ghostTiles.Clear();
+            _ghostPrevious.Clear();
         }
 
         private void PruneResults()
@@ -850,6 +976,20 @@ namespace CombolandsTweaks
             if (_failedProbes.Contains(tag))
                 return null;
 
+            Building probe = CreateCopy(tag);
+            if (probe == null)
+            {
+                _failedProbes.Add(tag);
+                return null;
+            }
+            _probe = probe;
+            _probeTag = tag;
+            return _probe;
+        }
+
+        // A hidden, inactive, never-built instance of a building.
+        private Building CreateCopy(GameTag tag)
+        {
             BuildingData data = ScriptableObjectSingleton<GamePieceDataHolder>.Instance.GetBuildingDataFor(tag);
             if (data == null || data.BuildingPrefab == null)
                 return null;
@@ -865,14 +1005,11 @@ namespace CombolandsTweaks
             catch (Exception e)
             {
                 Destroy(probe.gameObject);
-                _failedProbes.Add(tag);
                 Plugin.Log.LogError($"Couldn't create a scoring copy of {tag}: {e}");
                 return null;
             }
             probe.gameObject.SetActive(false);
-            _probe = probe;
-            _probeTag = tag;
-            return _probe;
+            return probe;
         }
 
         private void DestroyProbe()
@@ -888,10 +1025,11 @@ namespace CombolandsTweaks
         {
             Result r = _target is Key t ? Usable(t) : null;
             Camera cam = Camera.main;
-            if (r == null || r.Top.Count == 0 || cam == null || UnityEngine.InputSystem.Mouse.current == null)
+            List<Tile> spots = r != null && r.Plan.Count > 1 ? r.Plan : r?.Top;
+            if (spots == null || spots.Count == 0 || cam == null || UnityEngine.InputSystem.Mouse.current == null)
                 return;
-            _cycleIndex = (_cycleIndex + 1) % r.Top.Count;
-            Tile tile = r.Top[_cycleIndex];
+            _cycleIndex = (_cycleIndex + 1) % spots.Count;
+            Tile tile = spots[_cycleIndex];
             Vector3 screen = cam.WorldToScreenPoint(new Vector3(tile.X, tile.Y));
             UnityEngine.InputSystem.Mouse.current.WarpCursorPosition(new Vector2(screen.x, screen.y));
         }
@@ -916,7 +1054,9 @@ namespace CombolandsTweaks
                 return;
             _style.fontSize = Mathf.Clamp(Mathf.RoundToInt(tilePx * 0.32f * Plugin.ScoreTextScale.Value), 8, 60);
 
-            int marks = Mathf.Clamp(Plugin.ScoreMarkBest.Value, 0, TopCount);
+            if (r.Plan.Count > 1)
+                DrawPlan(cam, r, tilePx);
+            int marks = r.Plan.Count > 1 ? 0 : Mathf.Clamp(Plugin.ScoreMarkBest.Value, 0, TopCount);
             for (int i = 0; i < marks && i < r.Top.Count; i++)
                 DrawTileFrame(cam, r.Top[i], tilePx, i == 0 ? new Color(1f, 0.84f, 0.2f, 0.95f) : new Color(1f, 0.84f, 0.2f, 0.5f), i == 0 ? 3f : 2f);
 
@@ -949,6 +1089,31 @@ namespace CombolandsTweaks
             _tipStyle.normal.textColor = Color.white;
             _badgeStyle = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.MiddleCenter, fontStyle = FontStyle.Bold, wordWrap = false };
             _white = Texture2D.whiteTexture;
+        }
+
+        // Multi-placement plan: purple frames numbered in placing order, and the total at the top left.
+        private void DrawPlan(Camera cam, Result r, float tilePx)
+        {
+            var purple = new Color(0.8f, 0.5f, 1f, 0.95f);
+            _badgeStyle.fontSize = Mathf.Clamp(Mathf.RoundToInt(tilePx * 0.28f * Plugin.ScoreTextScale.Value), 9, 40);
+            for (int i = 0; i < r.Plan.Count; i++)
+            {
+                Tile t = r.Plan[i];
+                DrawTileFrame(cam, t, tilePx, purple, 3f);
+                Vector3 c = cam.WorldToScreenPoint(new Vector3(t.X - 0.32f, t.Y + 0.32f));
+                string n = (i + 1).ToString();
+                Vector2 size = _badgeStyle.CalcSize(new GUIContent(n));
+                _badgeStyle.normal.textColor = purple;
+                GUI.Box(new Rect(c.x - size.x / 2f - 3f, Screen.height - c.y - size.y / 2f, size.x + 6f, size.y + 2f), n, _badgeStyle);
+            }
+            var sb = new System.Text.StringBuilder($"Best {r.Plan.Count} placements: {Fmt(r.PlanTotal)}{(r.PerTurn ? "/turn" : "")}");
+            for (int i = 0; i < r.PlanGains.Count; i++)
+                sb.Append($"\n  {i + 1}. +{Fmt(r.PlanGains[i])}");
+            sb.Append($"\n{Plugin.CycleBestKey.Value} jumps between them while placing");
+            _tipStyle.fontSize = Mathf.Clamp(Mathf.RoundToInt(15 * Plugin.ScoreTextScale.Value), 10, 30);
+            var content = new GUIContent(sb.ToString());
+            Vector2 box = _tipStyle.CalcSize(content);
+            GUI.Box(new Rect(16f, Screen.height * 0.22f, box.x + 10f, box.y + 6f), content, _tipStyle);
         }
 
         private void DrawTileFrame(Camera cam, Tile tile, float tilePx, Color color, float thickness)
@@ -989,6 +1154,8 @@ namespace CombolandsTweaks
 
                 Result r = Usable(key);
                 string text = r == null ? "..." : r.Best > 0 ? $"Best {Fmt(r.Best)}{(r.PerTurn ? "/turn" : "")}" : "No points";
+                if (r != null && r.Plan.Count > 1)
+                    text += $"  \u00d7{r.Plan.Count}: {Fmt(r.PlanTotal)}";
                 Vector2 size = _badgeStyle.CalcSize(new GUIContent(text));
                 float x = (bottomLeft.x + topRight.x) / 2f - size.x / 2f - 4f;
                 float y = Screen.height - topRight.y - size.y - 8f;
@@ -1042,6 +1209,7 @@ namespace CombolandsTweaks
 
         private void OnDestroy()
         {
+            ClearGhosts();
             DestroyProbe();
         }
     }

@@ -12,7 +12,7 @@ namespace CombolandsTweaks
     {
         public const string Guid = "zeldo.combolands.tweaks";
         public const string Name = "Combolands Tweaks";
-        public const string Version = "0.10.0";
+        public const string Version = "0.11.0";
 
         internal static ManualLogSource Log;
 
@@ -22,6 +22,7 @@ namespace CombolandsTweaks
         internal static ConfigEntry<KeyboardShortcut> ScoreOverlayKey;
         internal static ConfigEntry<bool> ScoreCountNearby;
         internal static ConfigEntry<bool> ScorePerTurn;
+        internal static ConfigEntry<bool> ScorePlanMultiple;
         internal static ConfigEntry<bool> ScoreShowBreakdown;
         internal static ConfigEntry<bool> ScoreCardBadges;
         internal static ConfigEntry<int> ScoreMarkBest;
@@ -56,6 +57,8 @@ namespace CombolandsTweaks
                 "Add what the placement adds to existing buildings' scores (e.g. Flowers next to an Apiary).");
             ScorePerTurn = Config.Bind("Placement scores", "PerTurn", true,
                 "Score tiles in average points per turn (counts cooldowns, e.g. a Lamppost speeding up its neighbours) instead of points per activation.");
+            ScorePlanMultiple = Config.Bind("Placement scores", "PlanMultiple", true,
+                "For cards that place several copies, plan the best set of tiles (each copy scored with the earlier ones in place).");
             ScoreShowBreakdown = Config.Bind("Placement scores", "ShowBreakdown", true,
                 "Show the hovered tile's own / nearby split next to the cursor.");
             ScoreCardBadges = Config.Bind("Placement scores", "CardBadges", true,

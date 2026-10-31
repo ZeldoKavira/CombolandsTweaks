@@ -41,6 +41,8 @@ namespace CombolandsTweaks
                 " Include the bonus to nearby buildings");
             Plugin.ScorePerTurn.Value = GUILayout.Toggle(Plugin.ScorePerTurn.Value,
                 " Average points per turn (off: points per activation)");
+            Plugin.ScorePlanMultiple.Value = GUILayout.Toggle(Plugin.ScorePlanMultiple.Value,
+                " Plan the best set for multi-placement cards");
             Plugin.ScoreShowBreakdown.Value = GUILayout.Toggle(Plugin.ScoreShowBreakdown.Value,
                 " Show own / nearby split at the cursor");
             Plugin.ScoreCardBadges.Value = GUILayout.Toggle(Plugin.ScoreCardBadges.Value,
