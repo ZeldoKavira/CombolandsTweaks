@@ -12,7 +12,7 @@ namespace CombolandsTweaks
     {
         public const string Guid = "zeldo.combolands.tweaks";
         public const string Name = "Combolands Tweaks";
-        public const string Version = "0.12.0";
+        public const string Version = "0.12.1";
 
         internal static ManualLogSource Log;
 

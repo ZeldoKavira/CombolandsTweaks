@@ -1223,7 +1223,8 @@ namespace CombolandsTweaks
                     top = r.BestRank;
 
             var corners = new Vector3[4];
-            _badgeStyle.fontSize = Mathf.Clamp(Mathf.RoundToInt(15 * Plugin.ScoreTextScale.Value), 10, 30);
+            var content = new GUIContent();
+            int baseSize = Mathf.Clamp(Mathf.RoundToInt(15 * Plugin.ScoreTextScale.Value), 10, 30);
             foreach ((BuildingChoiceButton button, Key key) in _cards)
             {
                 if (button == null)
@@ -1234,13 +1235,30 @@ namespace CombolandsTweaks
                 Vector2 bottomLeft = RectTransformUtility.WorldToScreenPoint(cam, corners[0]);
                 Vector2 topRight = RectTransformUtility.WorldToScreenPoint(cam, corners[2]);
 
+                // One fact per line, shrunk to the card's width so neighbouring badges never overlap.
                 Result r = Usable(key);
-                string text = r == null ? "..." : r.BestRank <= 0 ? "No points"
-                    : (Math.Abs(r.Best) >= 0.05 ? $"Best {Fmt(r.Best)}{(r.PerTurn ? "/turn" : "")}" : "Best")
-                      + (r.BestOnce >= 0.5 ? $" +{Fmt(r.BestOnce)} now" : "");
-                if (r != null && r.Plan.Count > 1)
-                    text += $"  \u00d7{r.Plan.Count}: {Fmt(r.PlanTotal)}";
-                Vector2 size = _badgeStyle.CalcSize(new GUIContent(text));
+                var lines = new List<string>();
+                if (r == null)
+                    lines.Add("...");
+                else if (r.BestRank <= 0)
+                    lines.Add("No points");
+                else
+                {
+                    if (Math.Abs(r.Best) >= 0.05)
+                        lines.Add($"{Fmt(r.Best)}{(r.PerTurn ? "/turn" : "")}");
+                    if (r.BestOnce >= 0.5)
+                        lines.Add($"+{Fmt(r.BestOnce)} now");
+                    if (r.Plan.Count > 1)
+                        lines.Add($"\u00d7{r.Plan.Count}: {Fmt(r.PlanTotal)}{(r.PerTurn ? "/turn" : "")}");
+                }
+                content.text = string.Join("\n", lines);
+                float maxWidth = Mathf.Max(30f, (topRight.x - bottomLeft.x) * 0.92f) - 8f;
+                int fontSize = baseSize;
+                _badgeStyle.fontSize = fontSize;
+                while (fontSize > 8 && _badgeStyle.CalcSize(content).x > maxWidth)
+                    _badgeStyle.fontSize = --fontSize;
+                string text = content.text;
+                Vector2 size = _badgeStyle.CalcSize(content);
                 float x = (bottomLeft.x + topRight.x) / 2f - size.x / 2f - 4f;
                 float y = Screen.height - topRight.y - size.y - 8f;
                 _badgeStyle.normal.textColor = r != null && r.BestRank > 0 && r.BestRank == top && _cards.Count > 1 ? new Color(1f, 0.84f, 0.2f) : Color.white;
