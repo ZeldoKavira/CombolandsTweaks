@@ -7,3 +7,6 @@ obj/
 
 # Game code - regenerate with ./decompile.sh, never commit
 decompiled/
+
+# Fetched on demand by refs/strip-assembly.ps1
+refs/tools/

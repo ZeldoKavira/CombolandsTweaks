@@ -1,0 +1,80 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to publish the release
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # BepInEx is freely redistributable, so CI just fetches it rather than committing it.
+      - name: Fetch BepInEx
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/BepInEx/BepInEx/releases/download/v5.4.23.3/BepInEx_win_x64_5.4.23.3.zip'
+          Invoke-WebRequest -Uri $url -OutFile bepinex.zip -UseBasicParsing
+          Expand-Archive -Path bepinex.zip -DestinationPath bepinex -Force
+
+      # The game's assemblies can't be shipped, so the build uses the stripped reference
+      # copies in refs/Managed (see refs/update-refs.ps1). They carry metadata only.
+      - name: Build
+        shell: pwsh
+        run: |
+          dotnet build CombolandsTweaks/CombolandsTweaks.csproj -c Release --nologo `
+            -p:ManagedDir="$PWD/refs/Managed" `
+            -p:BepInExCore="$PWD/bepinex/BepInEx/core"
+
+      # The plugin's version lives in Plugin.cs (BepInEx reads it from [BepInPlugin]); a release tag
+      # must match it, or DeckyModManager would show one version and BepInEx load another.
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $m = Select-String -Path CombolandsTweaks/Plugin.cs -Pattern 'Version = "([0-9.]+)"'
+          if (-not $m) { throw 'Version not found in Plugin.cs' }
+          $v = $m.Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $tag = $env:GITHUB_REF_NAME.Substring(1)
+            if ($tag -ne $v) { throw "Tag v$tag does not match Plugin.cs version $v" }
+          }
+
+      # bepinex-root layout: the zip holds plugins/CombolandsTweaks.dll and unpacks into BepInEx/.
+      - name: Package
+        shell: pwsh
+        run: |
+          $stage = 'dist/stage/plugins'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item CombolandsTweaks/bin/Release/CombolandsTweaks.dll $stage
+          # ZipFile, not Compress-Archive, so entries use forward slashes: the Deck's installer runs on Linux.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [IO.Compression.ZipFile]::CreateFromDirectory("$PWD/dist/stage", "$PWD/dist/CombolandsTweaks-${{ steps.version.outputs.version }}.zip")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CombolandsTweaks-${{ steps.version.outputs.version }}
+          path: dist/CombolandsTweaks-*.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME "dist/CombolandsTweaks-${{ steps.version.outputs.version }}.zip" `
+            --title "Combolands Tweaks ${{ steps.version.outputs.version }}" `
+            --notes "Extract into the game's BepInEx folder (the zip holds plugins/CombolandsTweaks.dll), or install with DeckyModManager on Steam Deck. Needs BepInEx 5."
