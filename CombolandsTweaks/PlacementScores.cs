@@ -579,7 +579,10 @@ namespace CombolandsTweaks
                         how = (manure > 0 ? $", clears {manure} Manure next turn (+{Fmt(manure * perTurn)}/turn)" : "")
                               + (fromSheep > 0.005 ? $", ~{fromSheep:0.##} more activations/turn from Sheep Farm Manure" : "");
                     }
-                    score.Note = Join(score.Note, $"each activation: +{probe.Behaviour.GetMultParam(probe):0.##} mult to {targets} building{(targets == 1 ? "" : "s")} (+{Fmt(perTurn)}/turn, {Horizon():0} weeks left){how}");
+                    if (probe.Tag == GameTag.Banner)
+                        score.Note = Join(score.Note, $"when you remove it: +{probe.Behaviour.GetMultParam(probe):0.##} mult to {targets} adjacent building{(targets == 1 ? "" : "s")} (+{Fmt(perTurn)}/turn for good)");
+                    else
+                        score.Note = Join(score.Note, $"each activation: +{probe.Behaviour.GetMultParam(probe):0.##} mult to {targets} building{(targets == 1 ? "" : "s")} (+{Fmt(perTurn)}/turn, {Horizon():0} weeks left){how}");
                 }
                 long triggered = TriggeredPoints(probe, out int count);
                 if (triggered != 0)
@@ -695,13 +698,15 @@ namespace CombolandsTweaks
         }
 
         // Buildings that permanently add mult to others each time they activate: Composter (+0.1 to Farms in range),
-        // Field Hospital (+0.2 to Healing/Training in range), Cotton Field (+0.2 to every adjacent building).
+        // Field Hospital (+0.2 to Healing/Training in range), Cotton Field (+0.2 to every adjacent building), and Banner
+        // (+0.3 to every adjacent building, once, when it is removed).
         private static readonly Dictionary<GameTag, (UpgradePreview.Area area, bool useCategories)> Granters =
             new Dictionary<GameTag, (UpgradePreview.Area, bool)>
             {
                 { GameTag.Composter, (UpgradePreview.Area.Range, true) },
                 { GameTag.FieldHospital, (UpgradePreview.Area.Range, true) },
                 { GameTag.CottonField, (UpgradePreview.Area.Adjacent, false) },
+                { GameTag.Banner, (UpgradePreview.Area.Adjacent, false) },
             };
 
         internal static bool IsGranter(Building b) => Granters.ContainsKey(b.Tag);
@@ -863,6 +868,9 @@ namespace CombolandsTweaks
         // Average points per turn: one activation's worth (own points and what it triggers) times activations per turn.
         internal static double TurnValue(Building b, double factor = 1.0, bool grants = true)
         {
+            // A Banner never activates; its worth is the permanent mult its neighbours get once it's removed.
+            if (b.Tag == GameTag.Banner)
+                return grants ? GrantPerTurn(b) : 0;
             double rate = OwnRate(b);
             if (rate <= 0)
                 return 0;
