@@ -184,16 +184,16 @@ namespace CombolandsTweaks
         // How buildings trigger each other, modelled on the behaviours that call TriggerController.AddOnActivatedTrigger:
         // most pick (activation count) random buildings from their adjacent tiles or range each time they activate;
         // a few trigger every match. Ballista, Outpost, Post Office, Sparring Yard and Herb Garden aren't modelled.
-        private enum Area { Adjacent, Range }
+        internal enum Area { Adjacent, Range }
 
-        private struct Triggerer
+        internal struct Triggerer
         {
             public Area Area;
             public bool All;          // triggers every candidate instead of picking at random
             public bool UseCategories; // only buildings in its target categories
         }
 
-        private static readonly Dictionary<GameTag, Triggerer> Triggerers = new Dictionary<GameTag, Triggerer>
+        internal static readonly Dictionary<GameTag, Triggerer> Triggerers = new Dictionary<GameTag, Triggerer>
         {
             { GameTag.Sawmill, new Triggerer { Area = Area.Range, UseCategories = true } },
             { GameTag.Conduit, new Triggerer { Area = Area.Range } },
@@ -248,7 +248,7 @@ namespace CombolandsTweaks
             }
         }
 
-        private static List<Building> Candidates(Building t)
+        internal static List<Building> Candidates(Building t)
         {
             Triggerer cfg = Triggerers[t.Tag];
             HashSet<Tile> tiles = cfg.Area == Area.Range ? t.GetTilesInRange() : t.GetAdjacentTiles();
@@ -269,7 +269,7 @@ namespace CombolandsTweaks
             return list;
         }
 
-        private static double Share(Building t, List<Building> targets)
+        internal static double Share(Building t, List<Building> targets)
         {
             if (targets.Count == 0)
                 return 0;

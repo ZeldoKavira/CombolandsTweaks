@@ -399,6 +399,15 @@ namespace CombolandsTweaks
                     score.Own = PreviewTotal(probe, _passFactor);
                 }
 
+                // A building that triggers others (Marketplace -> Stalls, Sawmill, ...) earns their points when it
+                // activates; the game's preview only shows what it scores itself.
+                long triggered = TriggeredPoints(probe, out int count);
+                if (triggered != 0)
+                {
+                    score.Own += triggered;
+                    score.Note = Join(score.Note, $"triggers {count} building{(count == 1 ? "" : "s")}: +{triggered}");
+                }
+
                 if (_passNearby)
                 {
                     score.Nearby = NearbyGain(probe, tile);
@@ -461,6 +470,22 @@ namespace CombolandsTweaks
             if (gain != 0)
                 note = Join(note, $"Inventor +{mult:0.##} mult to neighbours");
             return gain;
+        }
+
+        // Points of the activations a triggering building hands out each time it activates: every candidate's
+        // preview points times the chance it gets picked (see UpgradePreview's trigger table).
+        private static long TriggeredPoints(Building probe, out int count)
+        {
+            count = 0;
+            if (!UpgradePreview.Triggerers.ContainsKey(probe.Tag))
+                return 0;
+            List<Building> targets = UpgradePreview.Candidates(probe);
+            count = targets.Count;
+            double share = UpgradePreview.Share(probe, targets);
+            double points = 0;
+            foreach (Building x in targets)
+                points += share * PreviewTotal(x, 1.0) * Math.Max(1, x.Behaviour.GetActivationCount(x));
+            return (long)Math.Round(points);
         }
 
         // What extra mult adds to an existing building's preview points.
