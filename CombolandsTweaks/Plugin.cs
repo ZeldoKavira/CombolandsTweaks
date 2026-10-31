@@ -12,7 +12,7 @@ namespace CombolandsTweaks
     {
         public const string Guid = "zeldo.combolands.tweaks";
         public const string Name = "Combolands Tweaks";
-        public const string Version = "0.5.2";
+        public const string Version = "0.6.0";
 
         internal static ManualLogSource Log;
 
@@ -31,6 +31,7 @@ namespace CombolandsTweaks
         internal static ConfigEntry<KeyboardShortcut> BuildingScoresKey;
 
         internal static ConfigEntry<bool> UpgradePreviewEnabled;
+        internal static ConfigEntry<bool> HeirloomCountsEnabled;
 
         internal static ConfigEntry<float> SpeedBoost;
 
@@ -70,6 +71,9 @@ namespace CombolandsTweaks
 
             UpgradePreviewEnabled = Config.Bind("Building upgrades", "Preview", true,
                 "While a building upgrade is hovered or picked, show points per turn now and with it on every building it can go on.");
+
+            HeirloomCountsEnabled = Config.Bind("Heirlooms", "ShowCounts", true,
+                "Add to heirloom popups how many you have and how many buildings of its categories are on the map.");
 
             SpeedBoost = Config.Bind("Game speed", "SpeedBoost", 1f,
                 new ConfigDescription("Extra speed on top of the game's own Game Speed setting.", new AcceptableValueRange<float>(1f, 5f)));

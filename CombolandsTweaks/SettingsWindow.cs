@@ -58,6 +58,8 @@ namespace CombolandsTweaks
 
             Plugin.UpgradePreviewEnabled.Value = GUILayout.Toggle(Plugin.UpgradePreviewEnabled.Value,
                 " Building upgrades: show points per turn now / with it");
+            Plugin.HeirloomCountsEnabled.Value = GUILayout.Toggle(Plugin.HeirloomCountsEnabled.Value,
+                " Heirloom popups: show how many you have");
 
             GUILayout.BeginHorizontal();
             GUILayout.Label($"Text size {Plugin.ScoreTextScale.Value:0.0}x", GUILayout.Width(110f));
