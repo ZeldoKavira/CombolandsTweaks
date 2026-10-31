@@ -37,18 +37,26 @@ namespace CombolandsTweaks
             public double Nearby;
             public string Note; // placement bonus that applied (Scaffolding, Nesting Doll, ...)
             public double Total => Own + Nearby;
+            // Points scored straight away when it's built (its own on-build activation and neighbours that react to
+            // construction); not part of the per-turn figure.
+            public double Once;
+            // For ranking tiles: per-turn points, plus one-off points spread over the weeks left in the milestone.
+            public double Rank => Total + Once / Horizon();
         }
 
         private class Result
         {
             public Dictionary<Tile, TileScore> Scores;
-            public double Best;
+            public double Best;     // per-turn points of the best tile
+            public double BestOnce; // one-off points of the best tile
+            public double BestRank;
             public bool PerTurn;
             public List<Tile> Top;
             // Cards that place several copies: the greedy best set of tiles, each copy's gain given the ones before.
             public List<Tile> Plan = new List<Tile>();
             public List<double> PlanGains = new List<double>();
             public double PlanTotal;
+            public double PlanOnce;
             public int Board;
             public bool Nearby;
             public float Time;
@@ -104,6 +112,7 @@ namespace CombolandsTweaks
         private readonly List<Tile> _ghostTiles = new List<Tile>();
         private readonly List<Building> _ghostPrevious = new List<Building>();
         private readonly List<double> _planGains = new List<double>();
+        private double _planOnce;
 
         // Existing buildings' own preview totals before the placement, and which of them can see each tile.
         private readonly Dictionary<Building, double> _baseline = new Dictionary<Building, double>();
@@ -276,6 +285,7 @@ namespace CombolandsTweaks
             _needWatchers = false;
             _stage0Scores = null;
             _planGains.Clear();
+            _planOnce = 0;
             _passTiles.Clear();
             _passScores = new Dictionary<Tile, TileScore>();
             _passIndex = 0;
@@ -379,7 +389,7 @@ namespace CombolandsTweaks
                     Tile tile = _passTiles[_passIndex++];
                     if (_ghostTiles.Contains(tile))
                         continue;
-                    if (ScoreAt(_probe, tile, controller, out TileScore score) && Math.Abs(score.Total) >= 0.05)
+                    if (ScoreAt(_probe, tile, controller, out TileScore score) && (Math.Abs(score.Total) >= 0.05 || score.Once >= 0.5))
                         _passScores[tile] = score;
                 }
                 ForgetCaches(_probe);
@@ -396,10 +406,11 @@ namespace CombolandsTweaks
             // One stage done: note this copy's best tile; plan the next copy with this one in place.
             if (_passStage == 0)
                 _stage0Scores = _passScores;
-            KeyValuePair<Tile, TileScore> best = _passScores.Where(e => e.Value.Total > 0).OrderByDescending(e => e.Value.Total).FirstOrDefault();
+            KeyValuePair<Tile, TileScore> best = _passScores.Where(e => e.Value.Rank > 0).OrderByDescending(e => e.Value.Rank).FirstOrDefault();
             if (best.Key != null)
             {
                 _planGains.Add(best.Value.Total);
+                _planOnce += best.Value.Once;
                 if (_passStage + 1 < _passKey.Count && AddGhost(best.Key))
                 {
                     _passStage++;
@@ -413,12 +424,14 @@ namespace CombolandsTweaks
 
             _passActive = false;
             Dictionary<Tile, TileScore> scores = _stage0Scores ?? _passScores;
-            List<Tile> top = scores.Where(e => e.Value.Total > 0).OrderByDescending(e => e.Value.Total).Take(TopCount).Select(e => e.Key).ToList();
+            List<Tile> top = scores.Where(e => e.Value.Rank > 0).OrderByDescending(e => e.Value.Rank).Take(TopCount).Select(e => e.Key).ToList();
             bool firstForBoard = Usable(_passKey) == null;
             var result = new Result
             {
                 Scores = scores,
                 Best = top.Count > 0 ? scores[top[0]].Total : 0,
+                BestOnce = top.Count > 0 ? scores[top[0]].Once : 0,
+                BestRank = top.Count > 0 ? scores[top[0]].Rank : 0,
                 Top = top,
                 Board = _passBoard,
                 Nearby = _passNearby,
@@ -430,6 +443,7 @@ namespace CombolandsTweaks
                 result.Plan.AddRange(_ghostTiles);
                 result.PlanGains.AddRange(_planGains);
                 result.PlanTotal = _planGains.Sum();
+                result.PlanOnce = _planOnce;
             }
             _results[_passKey] = result;
             ClearGhosts();
@@ -527,6 +541,7 @@ namespace CombolandsTweaks
                     try
                     {
                         score.Own = OwnValue(probe);
+                        score.Once = OnceValue(probe);
                     }
                     finally
                     {
@@ -537,13 +552,18 @@ namespace CombolandsTweaks
                 else
                 {
                     score.Own = OwnValue(probe);
+                    score.Once = OnceValue(probe);
                 }
-                if (_passPerTurn && OwnRate(probe) <= 0)
+                if (_passPerTurn && OwnRate(probe) <= 0 && score.Once < 0.5)
                 {
-                    long once = PreviewTotal(probe, _passFactor);
-                    if (once != 0)
-                        score.Note = Join(score.Note, $"no countdown: {once} per activation when something triggers it");
+                    long per = PreviewTotal(probe, _passFactor);
+                    if (per != 0)
+                        score.Note = Join(score.Note, $"no countdown: {per} per activation when something triggers it");
                 }
+                if (_passPerTurn && _passNearby)
+                    score.Once += ConstructionReactions(probe, tile, ref score.Note);
+                if (score.Once >= 0.5)
+                    score.Note = Join(score.Note, $"+{Fmt(score.Once)} now when built");
 
                 // A building that triggers others (Marketplace -> Stalls, Sawmill, ...) earns their points when it
                 // activates; the game's preview only shows what it scores itself.
@@ -850,6 +870,63 @@ namespace CombolandsTweaks
                     + (grants ? GrantValue(b) : 0)) * rate;
         }
 
+        // Hunting Bow repeats on-build triggers (TriggerController.AddOnBuiltTrigger).
+        private static int BuildTriggers() =>
+            1 + (MonoSingleton<ItemHeirloomController>.HasInstance && MonoSingleton<ItemHeirloomController>.Instance.IsItemWithTagEquipped(GameTag.HuntingBow) ? 1 : 0);
+
+        // Per-turn mode: what the building scores the moment it's built, if it activates on build.
+        private double OnceValue(Building probe)
+        {
+            if (!_passPerTurn || probe.Behaviour?.ValidTriggers == null || !probe.Behaviour.ValidTriggers.Contains(TriggerType.OnBuild))
+                return 0;
+            return (PreviewTotal(probe, _passFactor) * Math.Max(1, probe.Behaviour.GetActivationCount(probe)) + Delivered(probe, 1, grants: false))
+                   * BuildTriggers();
+        }
+
+        // Existing buildings that activate when something is built near them (BuildingConstructionOccurred): where
+        // they look (0 = anywhere, 1 = range, 2 = adjacent) and which of their target categories the new building
+        // must be in (0 = any).
+        private static readonly (GameTag tag, int area, int category)[] Reactors =
+        {
+            (GameTag.Depot, 0, 1),
+            (GameTag.Harvester, 1, 0),
+            (GameTag.WitchHut, 1, 0),
+            (GameTag.ToolShed, 1, 3),
+            (GameTag.Lantern, 2, 1),
+            (GameTag.WayStation, 2, 1),
+        };
+
+        private static double ConstructionReactions(Building probe, Tile tile, ref string note)
+        {
+            if (!MonoSingleton<BuildingController>.HasInstance)
+                return 0;
+            double total = 0;
+            foreach (Building r in MonoSingleton<BuildingController>.Instance.Buildings)
+            {
+                if (r == null || r.Behaviour == null)
+                    continue;
+                foreach ((GameTag tag, int area, int category) in Reactors)
+                {
+                    if (r.Tag != tag)
+                        continue;
+                    if (area == 1 && !r.GetTilesInRange().Contains(tile))
+                        break;
+                    if (area == 2 && !r.GetAdjacentTiles().Contains(tile))
+                        break;
+                    if (category > 0 && !probe.Categories.ContainsCategory(r.Behaviour.GetTargetCategoryByNumber(r, category)))
+                        break;
+                    double v = ActivationValue(r, 1, grants: false) * BuildTriggers();
+                    if (v >= 0.5)
+                    {
+                        total += v;
+                        note = Join(note, $"{NameOf(r.Tag)} reacts (+{Fmt(v)} now)");
+                    }
+                    break;
+                }
+            }
+            return total;
+        }
+
         // An existing building's worth in this pass's units.
         private double Value(Building b) => _passPerTurn ? TurnValue(b) : PreviewTotal(b, 1.0);
 
@@ -1068,11 +1145,15 @@ namespace CombolandsTweaks
                     continue;
                 Rect rect = new Rect(screen.x - tilePx / 2f, Screen.height - screen.y - tilePx / 4f, tilePx, tilePx / 2f);
                 double total = entry.Value.Total;
-                string text = Fmt(total);
+                // Tiles worth something only once show that in cyan, with a "+".
+                bool onceOnly = Math.Abs(total) < 0.05;
+                string text = onceOnly ? "+" + Fmt(entry.Value.Once) : Fmt(total);
 
                 _style.normal.textColor = new Color(0f, 0f, 0f, 0.85f);
                 GUI.Label(new Rect(rect.x + 1.5f, rect.y + 1.5f, rect.width, rect.height), text, _style);
-                _style.normal.textColor = ColorFor(total, r.Best);
+                _style.normal.textColor = onceOnly
+                    ? (Math.Abs(entry.Value.Rank - r.BestRank) < 1e-6 ? new Color(1f, 0.84f, 0.2f) : new Color(0.45f, 0.9f, 1f))
+                    : ColorFor(entry.Value.Rank, r.BestRank);
                 GUI.Label(rect, text, _style);
             }
 
@@ -1106,7 +1187,8 @@ namespace CombolandsTweaks
                 _badgeStyle.normal.textColor = purple;
                 GUI.Box(new Rect(c.x - size.x / 2f - 3f, Screen.height - c.y - size.y / 2f, size.x + 6f, size.y + 2f), n, _badgeStyle);
             }
-            var sb = new System.Text.StringBuilder($"Best {r.Plan.Count} placements: {Fmt(r.PlanTotal)}{(r.PerTurn ? "/turn" : "")}");
+            var sb = new System.Text.StringBuilder($"Best {r.Plan.Count} placements: {Fmt(r.PlanTotal)}{(r.PerTurn ? "/turn" : "")}"
+                                                   + (r.PlanOnce >= 0.5 ? $" +{Fmt(r.PlanOnce)} now" : ""));
             for (int i = 0; i < r.PlanGains.Count; i++)
                 sb.Append($"\n  {i + 1}. +{Fmt(r.PlanGains[i])}");
             sb.Append($"\n{Plugin.CycleBestKey.Value} jumps between them while placing");
@@ -1137,8 +1219,8 @@ namespace CombolandsTweaks
                 return;
             double top = double.MinValue;
             foreach ((BuildingChoiceButton _, Key key) in _cards)
-                if (Usable(key) is Result r && r.Best > top)
-                    top = r.Best;
+                if (Usable(key) is Result r && r.BestRank > top)
+                    top = r.BestRank;
 
             var corners = new Vector3[4];
             _badgeStyle.fontSize = Mathf.Clamp(Mathf.RoundToInt(15 * Plugin.ScoreTextScale.Value), 10, 30);
@@ -1153,13 +1235,15 @@ namespace CombolandsTweaks
                 Vector2 topRight = RectTransformUtility.WorldToScreenPoint(cam, corners[2]);
 
                 Result r = Usable(key);
-                string text = r == null ? "..." : r.Best > 0 ? $"Best {Fmt(r.Best)}{(r.PerTurn ? "/turn" : "")}" : "No points";
+                string text = r == null ? "..." : r.BestRank <= 0 ? "No points"
+                    : (Math.Abs(r.Best) >= 0.05 ? $"Best {Fmt(r.Best)}{(r.PerTurn ? "/turn" : "")}" : "Best")
+                      + (r.BestOnce >= 0.5 ? $" +{Fmt(r.BestOnce)} now" : "");
                 if (r != null && r.Plan.Count > 1)
                     text += $"  \u00d7{r.Plan.Count}: {Fmt(r.PlanTotal)}";
                 Vector2 size = _badgeStyle.CalcSize(new GUIContent(text));
                 float x = (bottomLeft.x + topRight.x) / 2f - size.x / 2f - 4f;
                 float y = Screen.height - topRight.y - size.y - 8f;
-                _badgeStyle.normal.textColor = r != null && r.Best > 0 && r.Best == top && _cards.Count > 1 ? new Color(1f, 0.84f, 0.2f) : Color.white;
+                _badgeStyle.normal.textColor = r != null && r.BestRank > 0 && r.BestRank == top && _cards.Count > 1 ? new Color(1f, 0.84f, 0.2f) : Color.white;
                 GUI.Box(new Rect(x, y, size.x + 8f, size.y + 4f), text, _badgeStyle);
             }
         }
@@ -1179,7 +1263,7 @@ namespace CombolandsTweaks
                     break;
                 }
             }
-            if (hovered == null || (r.Scores[hovered].Nearby == 0 && r.Scores[hovered].Note == null))
+            if (hovered == null || (r.Scores[hovered].Nearby == 0 && r.Scores[hovered].Note == null && r.Scores[hovered].Once < 0.5))
                 return;
 
             TileScore s = r.Scores[hovered];
