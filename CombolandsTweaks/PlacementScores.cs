@@ -1202,25 +1202,45 @@ namespace CombolandsTweaks
         {
             _candidates.Clear();
             _triggeredBy.Clear();
-            if (_watchers.TryGetValue(tile, out List<Building> watching))
-                _candidates.AddRange(watching);
+            AddCandidatesSeeing(tile);
             foreach (Building b in _alwaysWatch)
                 if (!_candidates.Contains(b))
                     _candidates.Add(b);
-            if (_candidates.Count == 0)
-                return 0;
 
             Building previous = tile.Building;
             double gain = 0;
             tile.AssignBuilding(probe);
+            // The game reads auras (Lighthouse, Balloon, Apothecary, Ocean Temple, Fisher, ...) through its building
+            // list and its tile -> buildings-in-range index, which only real builds update. Put the probe in both for
+            // the moment, and redo the Wall / Palisade enclosure with it in place.
+            var restore = EnterBoard(probe);
             try
             {
+                if (AuraTags.Contains(probe.Tag))
+                {
+                    // Buildings the aura reaches, and anything that scores them.
+                    foreach (Tile t in probe.GetTilesInRange().Concat(probe.GetAdjacentTiles()))
+                        AddReached(t);
+                }
+                if (probe.Tag == GameTag.Wall || probe.Tag == GameTag.Palisade)
+                    foreach (Tile t in Reenclose(probe.Tag, restore))
+                        AddReached(t);
+                // A Fisher passes its extra mult on to the Fishing buildings in its range.
+                foreach (Building b in _candidates.ToList())
+                    if (b != null && b.Tag == GameTag.Fisher)
+                        foreach (Tile t in b.GetTilesInRange())
+                            AddReached(t);
+                if (_candidates.Count == 0)
+                    return 0;
+
+                foreach (Building b in _candidates)
+                    if (b != null)
+                        ForgetCaches(b);
                 foreach (Building b in _candidates)
                 {
                     // Something built over is replaced, not boosted.
                     if (b == previous || b == null || !_baseline.TryGetValue(b, out double before))
                         continue;
-                    ForgetCaches(b);
                     gain += Value(b) - before;
                     // An existing triggering building that would now also pick the new one: what it hands out per
                     // activation changes (the new building's value, minus what random-pickers stop giving others).
@@ -1239,6 +1259,7 @@ namespace CombolandsTweaks
             }
             finally
             {
+                LeaveBoard(probe, restore);
                 if (previous != null)
                     tile.AssignBuilding(previous);
                 else
@@ -1248,6 +1269,134 @@ namespace CombolandsTweaks
                         ForgetCaches(b);
             }
             return gain;
+        }
+
+        private void AddCandidatesSeeing(Tile t)
+        {
+            if (t != null && _watchers.TryGetValue(t, out List<Building> watching))
+                foreach (Building b in watching)
+                    if (!_candidates.Contains(b))
+                        _candidates.Add(b);
+        }
+
+        // The building on a tile the aura changes, plus the buildings that can see that tile.
+        private void AddReached(Tile t)
+        {
+            if (t == null)
+                return;
+            if (!t.IsEmpty && t.Building != null && !_candidates.Contains(t.Building))
+                _candidates.Add(t.Building);
+            AddCandidatesSeeing(t);
+        }
+
+        // Buildings whose effect on others goes through the game's range index or enclosure sets rather than the
+        // tile they stand on: category / rarity / cooldown / range auras.
+        private static readonly HashSet<GameTag> AuraTags = new HashSet<GameTag>
+        {
+            GameTag.Lighthouse, GameTag.Balloon, GameTag.Apothecary, GameTag.OceanTemple, GameTag.Fisher, GameTag.Trapper,
+            GameTag.Park, GameTag.Quay, GameTag.Irrigation, GameTag.Stable, GameTag.TownBell, GameTag.Crane, GameTag.Plaza,
+            GameTag.MagicPortal, GameTag.Campfire, GameTag.Obelisk, GameTag.Lamppost, GameTag.Warehouse,
+        };
+
+        private class BoardRestore
+        {
+            public readonly List<Tile> RangeTiles = new List<Tile>();
+            public readonly List<Tile> TagTiles = new List<Tile>();
+            public bool InList;
+            public HashSet<Tile> Walls, Palisades;
+            public bool SwappedWalls, SwappedPalisades;
+        }
+
+        private static readonly AccessTools.FieldRef<BuildingController, List<Building>> BuildingList =
+            AccessTools.FieldRefAccess<BuildingController, List<Building>>("_buildings");
+        private static readonly AccessTools.FieldRef<BuildingController, Dictionary<Tile, HashSet<Building>>> RangeIndex =
+            AccessTools.FieldRefAccess<BuildingController, Dictionary<Tile, HashSet<Building>>>("_buildingsTilesRangeIndex");
+        private static readonly AccessTools.FieldRef<BuildingController, Dictionary<Tile, HashSet<GameTag>>> RangeTagIndex =
+            AccessTools.FieldRefAccess<BuildingController, Dictionary<Tile, HashSet<GameTag>>>("_buildingsTilesRangeTagIndex");
+        private static readonly AccessTools.FieldRef<BuildingController, HashSet<Tile>> InsideWalls =
+            AccessTools.FieldRefAccess<BuildingController, HashSet<Tile>>("_insideWalls");
+        private static readonly AccessTools.FieldRef<BuildingController, HashSet<Tile>> InsidePalisades =
+            AccessTools.FieldRefAccess<BuildingController, HashSet<Tile>>("_insidePalisades");
+
+        private static BoardRestore EnterBoard(Building probe)
+        {
+            var r = new BoardRestore();
+            BuildingController bc = MonoSingleton<BuildingController>.Instance;
+            List<Building> list = BuildingList(bc);
+            if (list != null && !list.Contains(probe))
+            {
+                list.Add(probe);
+                r.InList = true;
+            }
+            Dictionary<Tile, HashSet<Building>> index = RangeIndex(bc);
+            Dictionary<Tile, HashSet<GameTag>> tagIndex = RangeTagIndex(bc);
+            if (index != null && tagIndex != null)
+            {
+                foreach (Tile t in probe.GetTilesInRange())
+                {
+                    if (t == null)
+                        continue;
+                    if (!index.TryGetValue(t, out HashSet<Building> set))
+                        index[t] = set = new HashSet<Building>();
+                    if (set.Add(probe))
+                        r.RangeTiles.Add(t);
+                    if (!tagIndex.TryGetValue(t, out HashSet<GameTag> tags))
+                        tagIndex[t] = tags = new HashSet<GameTag>();
+                    if (tags.Add(probe.Tag))
+                        r.TagTiles.Add(t);
+                }
+            }
+            return r;
+        }
+
+        private static void LeaveBoard(Building probe, BoardRestore r)
+        {
+            BuildingController bc = MonoSingleton<BuildingController>.Instance;
+            if (r.InList)
+                BuildingList(bc)?.Remove(probe);
+            Dictionary<Tile, HashSet<Building>> index = RangeIndex(bc);
+            Dictionary<Tile, HashSet<GameTag>> tagIndex = RangeTagIndex(bc);
+            foreach (Tile t in r.RangeTiles)
+                if (index != null && index.TryGetValue(t, out HashSet<Building> set))
+                    set.Remove(probe);
+            foreach (Tile t in r.TagTiles)
+                if (tagIndex != null && tagIndex.TryGetValue(t, out HashSet<GameTag> tags))
+                    tags.Remove(probe.Tag);
+            if (r.SwappedWalls)
+                InsideWalls(bc) = r.Walls;
+            if (r.SwappedPalisades)
+                InsidePalisades(bc) = r.Palisades;
+        }
+
+        // BuildingController.RefreshBuildings' enclosure flood fill, with the probe (already on its tile) counted.
+        // Returns the tiles whose inside/outside status changes.
+        private static IEnumerable<Tile> Reenclose(GameTag wallTag, BoardRestore r)
+        {
+            BuildingController bc = MonoSingleton<BuildingController>.Instance;
+            MapController map = SerializedMonoSingleton<MapController>.Instance;
+            var outside = new HashSet<Tile>(map.Grid.GetFloodFillAreaWithDiagonals(map.Grid.GetTile(0, 0),
+                (Tile t) => t.IsEmpty || t.Building.Tag != wallTag));
+            var inside = new HashSet<Tile>();
+            foreach (Tile t in map.Grid)
+                if ((t.IsEmpty || t.Building.Tag != wallTag) && !outside.Contains(t))
+                    inside.Add(t);
+            HashSet<Tile> old;
+            if (wallTag == GameTag.Wall)
+            {
+                old = InsideWalls(bc);
+                r.Walls = old;
+                r.SwappedWalls = true;
+                InsideWalls(bc) = inside;
+            }
+            else
+            {
+                old = InsidePalisades(bc);
+                r.Palisades = old;
+                r.SwappedPalisades = true;
+                InsidePalisades(bc) = inside;
+            }
+            old = old ?? new HashSet<Tile>();
+            return inside.Where(t => !old.Contains(t)).Concat(old.Where(t => !inside.Contains(t))).ToList();
         }
 
         private void LogOnce(string message)
