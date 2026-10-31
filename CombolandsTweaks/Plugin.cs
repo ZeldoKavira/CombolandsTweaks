@@ -12,12 +12,17 @@ namespace CombolandsTweaks
     {
         public const string Guid = "zeldo.combolands.tweaks";
         public const string Name = "Combolands Tweaks";
-        public const string Version = "0.2.1";
+        public const string Version = "0.3.0";
 
         internal static ManualLogSource Log;
 
+        internal static ConfigEntry<KeyboardShortcut> MenuKey;
+
         internal static ConfigEntry<bool> ScoreOverlayEnabled;
         internal static ConfigEntry<KeyboardShortcut> ScoreOverlayKey;
+        internal static ConfigEntry<bool> ScoreCountNearby;
+        internal static ConfigEntry<bool> ScoreShowBreakdown;
+        internal static ConfigEntry<float> ScoreTextScale;
 
         private Harmony _harmony;
         private GameObject _host;
@@ -26,10 +31,18 @@ namespace CombolandsTweaks
         {
             Log = Logger;
 
+            MenuKey = Config.Bind("General", "MenuKey", new KeyboardShortcut(KeyCode.F8), "Opens the settings window.");
+
             ScoreOverlayEnabled = Config.Bind("Placement scores", "Enabled", true,
                 "Show on every tile how many points the hovered or currently placing building would score there.");
             ScoreOverlayKey = Config.Bind("Placement scores", "ToggleKey", new KeyboardShortcut(KeyCode.F7),
                 "Turns the placement score overlay on or off.");
+            ScoreCountNearby = Config.Bind("Placement scores", "IncludeNearbyBonus", true,
+                "Add what the placement adds to existing buildings' scores (e.g. Flowers next to an Apiary).");
+            ScoreShowBreakdown = Config.Bind("Placement scores", "ShowBreakdown", true,
+                "Show the hovered tile's own / nearby split next to the cursor.");
+            ScoreTextScale = Config.Bind("Placement scores", "TextScale", 1f,
+                new ConfigDescription("Size of the numbers on the tiles.", new AcceptableValueRange<float>(0.5f, 2f)));
 
             _harmony = new Harmony(Guid);
             _harmony.PatchAll(typeof(Plugin).Assembly);
@@ -38,6 +51,7 @@ namespace CombolandsTweaks
             DontDestroyOnLoad(_host);
             _host.hideFlags = HideFlags.HideAndDontSave;
             _host.AddComponent<PlacementScores>();
+            _host.AddComponent<SettingsWindow>();
 
             Log.LogInfo($"{Name} {Version} loaded");
         }

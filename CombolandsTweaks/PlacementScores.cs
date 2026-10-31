@@ -17,37 +17,55 @@ namespace CombolandsTweaks
 {
     // Shows, on every tile, the points the hovered (or currently placing) building card would score if placed there.
     // Uses the game's own placement preview (Behaviour.GetScorePreview x Multiplier, the green number shown at the
-    // cursor while placing) evaluated with a hidden copy of the building moved across the map.
+    // cursor while placing) evaluated with a hidden copy of the building moved across the map. Optionally adds what
+    // the placement adds to existing buildings' own previews (e.g. Flowers next to an Apiary).
     internal class PlacementScores : MonoBehaviour
     {
         private const float RefreshInterval = 1f;
 
-        // A full pass over the map takes ~10-15 ms, so it is spread over frames to avoid hitches.
+        // A full pass over the map takes 10-25 ms (more with neighbours), so it is spread over frames to avoid hitches.
         private const double FrameBudgetMs = 2.0;
 
-        private Dictionary<Tile, long> _scores = new Dictionary<Tile, long>();
+        private struct TileScore
+        {
+            public long Own;
+            public long Nearby;
+            public long Total => Own + Nearby;
+        }
+
+        private Dictionary<Tile, TileScore> _scores = new Dictionary<Tile, TileScore>();
         private long _best;
 
         private Building _probe;
         private GameTag _probeTag = GameTag.None;
+        private readonly HashSet<GameTag> _failedProbes = new HashSet<GameTag>();
 
         private GameTag _shownTag = GameTag.None;
         private GameTag _shownConsumable = GameTag.None;
         private int _shownBoard;
+        private bool _shownNearby;
         private float _nextRefresh;
         private bool _loggedError;
 
         // The pass in progress; its results replace _scores when it finishes.
         private bool _passActive;
         private bool _passLog;
+        private bool _passNearby;
         private readonly List<Tile> _passTiles = new List<Tile>();
         private int _passIndex;
-        private Dictionary<Tile, long> _passScores = new Dictionary<Tile, long>();
+        private Dictionary<Tile, TileScore> _passScores = new Dictionary<Tile, TileScore>();
         private long _passBest;
         private double _passFactor;
         private readonly Stopwatch _passTime = new Stopwatch();
 
+        // Existing buildings' own preview totals before the placement, and which of them can see each tile.
+        private readonly Dictionary<Building, long> _baseline = new Dictionary<Building, long>();
+        private readonly Dictionary<Tile, List<Building>> _watchers = new Dictionary<Tile, List<Building>>();
+        private readonly List<Building> _alwaysWatch = new List<Building>();
+        private readonly List<Building> _candidates = new List<Building>();
+
         private GUIStyle _style;
+        private GUIStyle _tipStyle;
 
         private void Update()
         {
@@ -68,6 +86,7 @@ namespace CombolandsTweaks
             }
 
             int board = BoardSignature();
+            bool nearby = Plugin.ScoreCountNearby.Value;
             bool targetChanged = tag != _shownTag || consumable != _shownConsumable;
             if (targetChanged)
             {
@@ -75,12 +94,13 @@ namespace CombolandsTweaks
                 _scores.Clear();
                 _best = 0;
             }
-            if (targetChanged || board != _shownBoard || (!_passActive && Time.unscaledTime >= _nextRefresh))
+            if (targetChanged || board != _shownBoard || nearby != _shownNearby || (!_passActive && Time.unscaledTime >= _nextRefresh))
             {
-                StartPass(tag, consumable, log: targetChanged || board != _shownBoard);
+                StartPass(tag, consumable, nearby, log: targetChanged || board != _shownBoard);
                 _shownTag = tag;
                 _shownConsumable = consumable;
                 _shownBoard = board;
+                _shownNearby = nearby;
             }
             if (_passActive)
                 StepPass();
@@ -146,7 +166,7 @@ namespace CombolandsTweaks
             }
         }
 
-        private void StartPass(GameTag tag, GameTag consumable, bool log)
+        private void StartPass(GameTag tag, GameTag consumable, bool nearby, bool log)
         {
             _passActive = false;
             _passTiles.Clear();
@@ -163,9 +183,60 @@ namespace CombolandsTweaks
                 if (tile != null)
                     _passTiles.Add(tile);
             _passFactor = consumable == GameTag.BsNegMult ? 0.5 : 1.0;
+            _passNearby = nearby;
             _passLog = log;
             _passActive = true;
+            _passTime.Start();
             BuildingExtensions.ResetCaches();
+            if (nearby)
+                CollectWatchers();
+            _passTime.Stop();
+        }
+
+        // Baseline preview of every existing building, and for each tile the buildings whose range or adjacency covers
+        // it (those are the only ones a new neighbour there can change).
+        private void CollectWatchers()
+        {
+            _baseline.Clear();
+            _watchers.Clear();
+            _alwaysWatch.Clear();
+            foreach (Building b in MonoSingleton<BuildingController>.Instance.Buildings)
+            {
+                if (b == null || b == _probe)
+                    continue;
+                try
+                {
+                    _baseline[b] = PreviewTotal(b, 1.0);
+                    if (b.Tag == GameTag.TownHall)
+                    {
+                        // Scores a contiguous residential block, which can reach beyond its adjacent tiles.
+                        _alwaysWatch.Add(b);
+                        continue;
+                    }
+                    AddWatcher(b, b.GetTilesInRange());
+                    AddWatcher(b, b.GetAdjacentTiles());
+                }
+                catch (Exception e)
+                {
+                    _baseline.Remove(b);
+                    LogOnce($"Baseline for {b.Tag} at {b.X},{b.Y} failed: {e}");
+                }
+            }
+        }
+
+        private void AddWatcher(Building b, HashSet<Tile> tiles)
+        {
+            if (tiles == null)
+                return;
+            foreach (Tile t in tiles)
+            {
+                if (t == null)
+                    continue;
+                if (!_watchers.TryGetValue(t, out List<Building> list))
+                    _watchers[t] = list = new List<Building>();
+                if (!list.Contains(b))
+                    list.Add(b);
+            }
         }
 
         private void StepPass()
@@ -182,14 +253,13 @@ namespace CombolandsTweaks
             while (_passIndex < _passTiles.Count && frame.Elapsed.TotalMilliseconds < FrameBudgetMs)
             {
                 Tile tile = _passTiles[_passIndex++];
-                long total = ScoreAt(_probe, tile, controller, _passFactor);
-                if (total == 0)
+                if (!ScoreAt(_probe, tile, controller, out TileScore score) || score.Total == 0)
                     continue;
-                _passScores[tile] = total;
-                if (total > _passBest)
-                    _passBest = total;
+                _passScores[tile] = score;
+                if (score.Total > _passBest)
+                    _passBest = score.Total;
             }
-            ForgetProbeCaches(_probe);
+            ForgetCaches(_probe);
             _passTime.Stop();
 
             if (_passIndex < _passTiles.Count)
@@ -200,37 +270,90 @@ namespace CombolandsTweaks
             _best = _passBest;
             _nextRefresh = Time.unscaledTime + RefreshInterval;
             if (_passLog)
-                Plugin.Log.LogInfo($"Placement scores for {_probeTag}: {_scores.Count} tiles, best {_best} ({_passTime.Elapsed.TotalMilliseconds:F1} ms)");
+                Plugin.Log.LogInfo($"Placement scores for {_probeTag}: {_scores.Count} tiles, best {_best} ({_passTime.Elapsed.TotalMilliseconds:F1} ms{(_passNearby ? ", with nearby" : "")})");
         }
 
-        private long ScoreAt(Building probe, Tile tile, BuildingController controller, double factor)
+        private bool ScoreAt(Building probe, Tile tile, BuildingController controller, out TileScore score)
         {
+            score = default;
             try
             {
                 probe.transform.position = new Vector3(tile.X, tile.Y);
-                ForgetProbeCaches(probe);
+                ForgetCaches(probe);
 
                 if (!controller.CanBuildBuildingAt(probe, tile.X, tile.Y, out CantPlaceBuildingReason reason)
                     || reason == CantPlaceBuildingReason.NestingDolls)
-                    return 0;
+                    return false;
 
-                Dictionary<Tile, long> preview = probe.Behaviour.GetScorePreview(probe);
-                if (preview == null)
-                    return 0;
-                long sum = 0;
-                foreach (long v in preview.Values)
-                    sum += v;
-                return (long)Math.Round(sum * probe.Multiplier * factor);
+                score.Own = PreviewTotal(probe, _passFactor);
+                if (_passNearby)
+                    score.Nearby = NearbyGain(probe, tile);
+                return true;
             }
             catch (Exception e)
             {
-                if (!_loggedError)
-                {
-                    _loggedError = true;
-                    Plugin.Log.LogError($"Scoring {probe.Tag} at {tile.X},{tile.Y} failed: {e}");
-                }
-                return 0;
+                LogOnce($"Scoring {probe.Tag} at {tile.X},{tile.Y} failed: {e}");
+                return false;
             }
+        }
+
+        // The game's green placement number: the building's preview points times its multiplier.
+        private static long PreviewTotal(Building b, double factor)
+        {
+            Dictionary<Tile, long> preview = b.Behaviour?.GetScorePreview(b);
+            if (preview == null)
+                return 0;
+            long sum = 0;
+            foreach (long v in preview.Values)
+                sum += v;
+            return (long)Math.Round(sum * b.Multiplier * factor);
+        }
+
+        // Puts the probe on the tile for a moment and re-runs the preview of every existing building that can see it.
+        private long NearbyGain(Building probe, Tile tile)
+        {
+            _candidates.Clear();
+            if (_watchers.TryGetValue(tile, out List<Building> watching))
+                _candidates.AddRange(watching);
+            foreach (Building b in _alwaysWatch)
+                if (!_candidates.Contains(b))
+                    _candidates.Add(b);
+            if (_candidates.Count == 0)
+                return 0;
+
+            Building previous = tile.Building;
+            long gain = 0;
+            tile.AssignBuilding(probe);
+            try
+            {
+                foreach (Building b in _candidates)
+                {
+                    // Something built over is replaced, not boosted.
+                    if (b == previous || b == null || !_baseline.TryGetValue(b, out long before))
+                        continue;
+                    ForgetCaches(b);
+                    gain += PreviewTotal(b, 1.0) - before;
+                }
+            }
+            finally
+            {
+                if (previous != null)
+                    tile.AssignBuilding(previous);
+                else
+                    tile.RemoveCurrentBuilding();
+                foreach (Building b in _candidates)
+                    if (b != null)
+                        ForgetCaches(b);
+            }
+            return gain;
+        }
+
+        private void LogOnce(string message)
+        {
+            if (_loggedError)
+                return;
+            _loggedError = true;
+            Plugin.Log.LogError(message);
         }
 
         private static readonly AccessTools.FieldRef<Dictionary<Building, HashSet<Tile>>> AdjacencyCache =
@@ -242,15 +365,16 @@ namespace CombolandsTweaks
         private static readonly AccessTools.FieldRef<Dictionary<(Building, GamePieceCategory), int>> CategoryAdjacencyCache =
             AccessTools.StaticFieldRefAccess<Dictionary<(Building, GamePieceCategory), int>>(AccessTools.Field(typeof(BuildingExtensions), "_countsOfCategoryAdjacentTo"));
 
-        // The game's range/adjacency caches are keyed by building. Only the probe moves, so dropping just its entries
-        // keeps every other building's cached results valid (BuildingExtensions.ResetCaches per tile was ~20-50 ms).
-        private static void ForgetProbeCaches(Building probe)
+        // The game's range/adjacency caches are keyed by building. Dropping just the entries of the buildings whose
+        // surroundings changed keeps everyone else's cached results valid.
+        private static void ForgetCaches(Building building)
         {
-            AdjacencyCache()?.Remove(probe);
-            RangeCache()?.Remove(probe);
-            RemoveKeys(OverrideTileRangeCache(), k => k.Item1 == probe);
-            RemoveKeys(CategoryAdjacencyCache(), k => k.Item1 == probe);
-            probe.Values.ResetCaches();
+            AdjacencyCache()?.Remove(building);
+            RangeCache()?.Remove(building);
+            RemoveKeys(OverrideTileRangeCache(), k => k.Item1 == building);
+            RemoveKeys(CategoryAdjacencyCache(), k => k.Item1 == building);
+            if (building.Values != null)
+                building.Values.ResetCaches();
         }
 
         private static readonly List<object> KeyScratch = new List<object>();
@@ -268,7 +392,7 @@ namespace CombolandsTweaks
         }
 
         // A hidden, never-built copy of the building, the same kind of instance the game creates for its placement
-        // ghost. It never occupies a tile, so moving it around doesn't affect the board.
+        // ghost. It only occupies a tile for the moment NearbyGain needs it to.
         private Building GetProbe(GameTag tag)
         {
             if (_probe != null && _probeTag == tag)
@@ -302,8 +426,6 @@ namespace CombolandsTweaks
             return _probe;
         }
 
-        private readonly HashSet<GameTag> _failedProbes = new HashSet<GameTag>();
-
         private void DestroyProbe()
         {
             if (_probe != null)
@@ -332,23 +454,56 @@ namespace CombolandsTweaks
             if (tilePx < 8f)
                 return;
             if (_style == null)
+            {
                 _style = new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, fontStyle = FontStyle.Bold, clipping = TextClipping.Overflow, wordWrap = false };
-            _style.fontSize = Mathf.Clamp(Mathf.RoundToInt(tilePx * 0.32f), 9, 40);
+                _tipStyle = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.MiddleLeft, fontStyle = FontStyle.Bold, wordWrap = false };
+                _tipStyle.normal.textColor = Color.white;
+            }
+            _style.fontSize = Mathf.Clamp(Mathf.RoundToInt(tilePx * 0.32f * Plugin.ScoreTextScale.Value), 8, 60);
 
-            foreach (KeyValuePair<Tile, long> entry in _scores)
+            foreach (KeyValuePair<Tile, TileScore> entry in _scores)
             {
                 // Lower part of the tile, below where the game draws its own per-tile preview numbers.
                 Vector3 screen = cam.WorldToScreenPoint(new Vector3(entry.Key.X, entry.Key.Y - 0.28f));
                 if (screen.z < 0f)
                     continue;
                 Rect rect = new Rect(screen.x - tilePx / 2f, Screen.height - screen.y - tilePx / 4f, tilePx, tilePx / 2f);
-                string text = entry.Value.ToString();
+                long total = entry.Value.Total;
+                string text = total.ToString();
 
                 _style.normal.textColor = new Color(0f, 0f, 0f, 0.85f);
                 GUI.Label(new Rect(rect.x + 1.5f, rect.y + 1.5f, rect.width, rect.height), text, _style);
-                _style.normal.textColor = ColorFor(entry.Value);
+                _style.normal.textColor = ColorFor(total);
                 GUI.Label(rect, text, _style);
             }
+
+            if (Plugin.ScoreShowBreakdown.Value && Plugin.ScoreCountNearby.Value)
+                DrawBreakdown(cam);
+        }
+
+        // Next to the cursor: how the hovered tile's number splits into the building's own points and the bonus to
+        // the buildings around it.
+        private void DrawBreakdown(Camera cam)
+        {
+            Vector3 world = cam.ScreenToWorldPoint(Input.mousePosition);
+            Tile hovered = null;
+            foreach (Tile t in _scores.Keys)
+            {
+                if (t.X == Mathf.RoundToInt(world.x) && t.Y == Mathf.RoundToInt(world.y))
+                {
+                    hovered = t;
+                    break;
+                }
+            }
+            if (hovered == null || _scores[hovered].Nearby == 0)
+                return;
+
+            TileScore s = _scores[hovered];
+            string text = $"{s.Own} own  {(s.Nearby > 0 ? "+" : "")}{s.Nearby} nearby";
+            _tipStyle.fontSize = Mathf.Clamp(Mathf.RoundToInt(14 * Plugin.ScoreTextScale.Value), 10, 32);
+            Vector2 size = _tipStyle.CalcSize(new GUIContent(text));
+            Vector2 mouse = new Vector2(Input.mousePosition.x, Screen.height - Input.mousePosition.y);
+            GUI.Box(new Rect(mouse.x + 18f, mouse.y + 18f, size.x + 8f, size.y + 4f), text, _tipStyle);
         }
 
         // White for low scores through green, gold for the best tile(s).
